@@ -18,21 +18,24 @@ import {
   executeQuery,
   executePrepared,
   executeWithReusedStatement,
+  streamQuery,
+  flushWAL,
   closeLbug,
   withLbugDb,
+  isReadOnlyDbError,
 } from '../core/lbug/lbug-adapter.js';
-import { isWriteQuery } from '../core/lbug/pool-adapter.js';
+import { isValidQueryParams } from '../core/lbug/query-params.js';
 import { NODE_TABLES, type GraphNode, type GraphRelationship } from 'gitnexus-shared';
 import { searchFTSFromLbug } from '../core/search/bm25-index.js';
 import { hybridSearch } from '../core/search/hybrid-search.js';
-// Embedding imports are lazy (dynamic import) to avoid loading onnxruntime-node
-// at server startup — crashes on unsupported Node ABI versions (#89)
 import { LocalBackend } from '../mcp/local/local-backend.js';
 import { mountMCPEndpoints } from './mcp-http.js';
 import { fork } from 'child_process';
 import { fileURLToPath, pathToFileURL } from 'url';
 import { JobManager } from './analyze-job.js';
+import { assertString, escapeRegExp, BadRequestError, createRouteLimiter } from './validation.js';
 import { extractRepoName, getCloneDir, cloneOrPull } from './git-clone.js';
+import { logger, flushLoggerSync } from '../core/logger.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -105,73 +108,338 @@ export const isAllowedOrigin = (origin: string | undefined): boolean => {
   return false;
 };
 
+type GraphStreamRecord =
+  | { type: 'node'; data: GraphNode }
+  | { type: 'relationship'; data: GraphRelationship }
+  | { type: 'error'; error: string };
+
+export class ClientDisconnectedError extends Error {
+  constructor() {
+    super('Client disconnected during graph stream');
+    this.name = 'ClientDisconnectedError';
+  }
+}
+
+export const isIgnorableGraphQueryError = (err: unknown): boolean => {
+  const message = err instanceof Error ? err.message : String(err);
+  return (
+    message.includes('does not exist') ||
+    message.includes('not found') ||
+    message.includes('No table named')
+  );
+};
+
+export const SPA_FALLBACK_REGEX = /^(?!\/api(?:\/|$))(?!.*\.\w{1,10}$).*/;
+
+export const resolveWebDistDir = async (
+  primaryDir: string,
+  fallbackDir: string,
+): Promise<string | null> => {
+  const envDir = process.env.GITNEXUS_WEB_DIST;
+  const dirs = envDir ? [envDir, primaryDir, fallbackDir] : [primaryDir, fallbackDir];
+  for (const dir of dirs) {
+    try {
+      await fs.access(path.join(dir, 'index.html'));
+      return dir;
+    } catch (err: any) {
+      if (err?.code !== 'ENOENT') {
+        logger.warn({ err: err.message }, `[serve] could not access web UI dir ${dir}:`);
+      }
+    }
+  }
+  return null;
+};
+
+export const landingPageHtml = (): string => `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>GitNexus</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Outfit,system-ui,-apple-system,sans-serif;background:#06060a;color:#e4e4ed;min-height:100vh;display:flex;align-items:center;justify-content:center;padding:1.5rem}
+.card{background:#101018;border:1px solid #2a2a3a;border-radius:0.75rem;padding:2rem;max-width:480px;width:100%}
+.logo{font-size:1.5rem;font-weight:700;color:#e4e4ed;letter-spacing:-0.02em;margin-bottom:0.25rem}
+.subtitle{font-size:0.875rem;color:#8888a0;margin-bottom:1.5rem}
+.section-title{font-size:0.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#5a5a70;margin-bottom:0.75rem}
+.endpoint{margin:0.25rem 0;font-size:0.875rem}
+.endpoint a{color:#7c3aed;text-decoration:none}
+.endpoint a:hover{text-decoration:underline}
+.endpoint code{background:#16161f;padding:0.15em 0.4em;border-radius:0.25rem;font-size:0.8rem;color:#8888a0}
+.divider{height:1px;background:#1e1e2a;margin:1.25rem 0}
+.terminal{background:#0a0a10;border:1px solid #1e1e2a;border-radius:0.5rem;padding:0.75rem 1rem;font-family:'SF Mono',SFMono-Regular,Consolas,'Liberation Mono',Menlo,monospace;font-size:0.8rem;color:#8888a0;margin-bottom:1rem;overflow-x:auto}
+.terminal .prompt{color:#7c3aed;user-select:none}
+.terminal .cmd{color:#e4e4ed}
+.link-row{display:flex;align-items:center;gap:0.5rem;font-size:0.875rem;margin-top:0.5rem}
+.link-row svg{flex-shrink:0}
+a.ext{color:#7c3aed;text-decoration:none;display:inline-flex;align-items:center;gap:0.25rem}
+a.ext:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="logo">GitNexus</div>
+  <div class="subtitle">API server is running</div>
+  <div class="section-title">Endpoints</div>
+  <p class="endpoint"><a href="/api/info">/api/info</a> <span style="color:#5a5a70">— Server version &amp; context</span></p>
+  <p class="endpoint"><a href="/api/repos">/api/repos</a> <span style="color:#5a5a70">— Indexed repositories</span></p>
+  <p class="endpoint"><code>/api/health</code> <span style="color:#5a5a70">— Docker/orchestrator healthcheck</span></p>
+  <p class="endpoint"><code>/api/heartbeat</code> <span style="color:#5a5a70">— SSE heartbeat</span></p>
+  <p class="endpoint"><code>/api/graph</code> <code>/api/query</code> <code>/api/search</code> <span style="color:#5a5a70">— Data</span></p>
+  <p class="endpoint"><code>/api/mcp</code> <span style="color:#5a5a70">— MCP over StreamableHTTP</span></p>
+  <div class="divider"></div>
+  <div class="section-title">Web UI not found</div>
+  <div class="terminal"><span class="prompt">$ </span><span class="cmd">cd gitnexus-web &amp;&amp; npm run build</span></div>
+  <div class="link-row">
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="#7c3aed" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+    <a class="ext" href="https://gitnexus.vercel.app" target="_blank" rel="noopener noreferrer">gitnexus.vercel.app</a>
+    <span style="color:#5a5a70">— connects to this server</span>
+  </div>
+</div>
+</body>
+</html>`;
+
+export const staticCacheControlSetHeaders = (res: express.Response, filePath: string): void => {
+  if (filePath.endsWith('.html')) {
+    res.setHeader('Cache-Control', 'no-cache');
+  } else {
+    res.setHeader('Cache-Control', 'public, max-age=31536000, immutable');
+  }
+};
+
+export const registerWebUI = (app: express.Express, staticDir: string | null): void => {
+  if (staticDir) {
+    app.use(
+      express.static(staticDir, {
+        setHeaders: staticCacheControlSetHeaders,
+      }),
+    );
+    // ⚠ This must remain the LAST route before the global error handler.
+    // The regex excludes /api paths AND paths with file extensions (.js, .css, etc.)
+    // so missing assets get real 404s instead of the SPA HTML.
+    // Adding routes below this will be unreachable for non-API, non-asset paths.
+    // Rate-limited (CodeQL js/missing-rate-limiting): the SPA fallback
+    // serves a constant index.html, but the FS access from a route handler
+    // is enough to trip the analyzer. The limit is generous (300 rpm/IP =
+    // 5 req/s sustained) so that multi-tab browser navigation, prefetch,
+    // and service-worker revalidation do not produce 429s for legitimate
+    // SPA users. At this rate, real browser navigation is extremely
+    // unlikely to hit the limit in practice, so the cosmetic issue of
+    // JSON-on-429 to a browser is a low-likelihood path. Content
+    // negotiation on the 429 (returning the SPA shell to HTML clients
+    // instead of `{ error: '...' }`) would require swapping
+    // express-rate-limit's `message` for a `handler` function and is
+    // deferred to keep this PR focused on closing the CodeQL alert.
+    app.get(SPA_FALLBACK_REGEX, createRouteLimiter({ limit: 300 }), (_req, res) => {
+      res.sendFile(path.join(staticDir, 'index.html'));
+    });
+  } else {
+    app.get('/', (_req, res) => {
+      res.type('html').send(landingPageHtml());
+    });
+  }
+};
+
+const ensureStreamIsWritable = (res: express.Response, signal?: AbortSignal): void => {
+  if (signal?.aborted || res.destroyed || res.writableEnded) {
+    throw new ClientDisconnectedError();
+  }
+};
+
+const waitForDrain = async (res: express.Response, signal?: AbortSignal): Promise<void> => {
+  ensureStreamIsWritable(res, signal);
+
+  await new Promise<void>((resolve, reject) => {
+    const cleanup = () => {
+      res.off('drain', onDrain);
+      res.off('close', onClose);
+      signal?.removeEventListener('abort', onAbort);
+    };
+
+    const onDrain = () => {
+      cleanup();
+      resolve();
+    };
+    const onClose = () => {
+      cleanup();
+      reject(new ClientDisconnectedError());
+    };
+    const onAbort = () => {
+      cleanup();
+      reject(new ClientDisconnectedError());
+    };
+
+    res.once('drain', onDrain);
+    res.once('close', onClose);
+    signal?.addEventListener('abort', onAbort, { once: true });
+
+    if (signal?.aborted || res.destroyed || res.writableEnded) {
+      onAbort();
+    }
+  });
+
+  ensureStreamIsWritable(res, signal);
+};
+
+const isClientDisconnectWriteError = (err: unknown): boolean => {
+  if (!(err instanceof Error)) return false;
+  return (
+    (err as NodeJS.ErrnoException).code === 'ERR_STREAM_DESTROYED' ||
+    (err as NodeJS.ErrnoException).code === 'EPIPE' ||
+    (err as NodeJS.ErrnoException).code === 'ECONNRESET' ||
+    err.message.includes('write after end')
+  );
+};
+
+export const writeNdjsonRecord = async (
+  res: express.Response,
+  record: GraphStreamRecord,
+  signal?: AbortSignal,
+): Promise<void> => {
+  ensureStreamIsWritable(res, signal);
+
+  try {
+    const canContinue = res.write(JSON.stringify(record) + '\n');
+    if (!canContinue) {
+      await waitForDrain(res, signal);
+    }
+  } catch (err) {
+    if (isClientDisconnectWriteError(err)) {
+      throw new ClientDisconnectedError();
+    }
+    throw err;
+  }
+};
+
 const buildGraph = async (
   includeContent = false,
 ): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
   const nodes: GraphNode[] = [];
   for (const table of NODE_TABLES) {
     try {
-      let query = '';
-      if (table === 'File') {
-        query = includeContent
-          ? `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`
-          : `MATCH (n:File) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
-      } else if (table === 'Folder') {
-        query = `MATCH (n:Folder) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
-      } else if (table === 'Community') {
-        query = `MATCH (n:Community) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
-      } else if (table === 'Process') {
-        query = `MATCH (n:Process) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
-      } else {
-        query = includeContent
-          ? `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`
-          : `MATCH (n:${table}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
-      }
-
-      const rows = await executeQuery(query);
+      const rows = await executeQuery(getNodeQuery(table, includeContent));
       for (const row of rows) {
-        nodes.push({
-          id: row.id ?? row[0],
-          label: table as GraphNode['label'],
-          properties: {
-            name: row.name ?? row.label ?? row[1],
-            filePath: row.filePath ?? row[2],
-            startLine: row.startLine,
-            endLine: row.endLine,
-            content: includeContent ? row.content : undefined,
-            heuristicLabel: row.heuristicLabel,
-            cohesion: row.cohesion,
-            symbolCount: row.symbolCount,
-            processType: row.processType,
-            stepCount: row.stepCount,
-            communities: row.communities,
-            entryPointId: row.entryPointId,
-            terminalId: row.terminalId,
-          } as GraphNode['properties'],
-        });
+        nodes.push(mapGraphNodeRow(table, row, includeContent));
       }
-    } catch {
-      // ignore empty tables
+    } catch (err) {
+      if (!isIgnorableGraphQueryError(err)) {
+        throw err;
+      }
     }
   }
 
   const relationships: GraphRelationship[] = [];
-  const relRows = await executeQuery(
-    `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`,
-  );
+  const relRows = await executeQuery(GRAPH_RELATIONSHIP_QUERY);
   for (const row of relRows) {
-    relationships.push({
-      id: `${row.sourceId}_${row.type}_${row.targetId}`,
-      type: row.type,
-      sourceId: row.sourceId,
-      targetId: row.targetId,
-      confidence: row.confidence,
-      reason: row.reason,
-      step: row.step,
-    });
+    relationships.push(mapGraphRelationshipRow(row));
   }
 
   return { nodes, relationships };
+};
+
+const GRAPH_RELATIONSHIP_QUERY =
+  `MATCH (a)-[r:CodeRelation]->(b) RETURN a.id AS sourceId, b.id AS targetId, ` +
+  `r.type AS type, r.confidence AS confidence, r.reason AS reason, r.step AS step`;
+
+const quoteNodeTable = (table: string): string => `\`${table.replace(/`/g, '``')}\``;
+
+const getNodeQuery = (table: string, includeContent: boolean): string => {
+  const tableLabel = quoteNodeTable(table);
+
+  if (table === 'File') {
+    return includeContent
+      ? `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.content AS content`
+      : `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+  }
+  if (table === 'Folder') {
+    return `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath`;
+  }
+  if (table === 'Community') {
+    return `MATCH (n:${tableLabel}) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.cohesion AS cohesion, n.symbolCount AS symbolCount`;
+  }
+  if (table === 'Process') {
+    return `MATCH (n:${tableLabel}) RETURN n.id AS id, n.label AS label, n.heuristicLabel AS heuristicLabel, n.processType AS processType, n.stepCount AS stepCount, n.communities AS communities, n.entryPointId AS entryPointId, n.terminalId AS terminalId`;
+  }
+  if (table === 'Route') {
+    return `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.responseKeys AS responseKeys, n.errorKeys AS errorKeys, n.middleware AS middleware`;
+  }
+  if (table === 'Tool') {
+    return `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.description AS description`;
+  }
+  return includeContent
+    ? `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine, n.content AS content`
+    : `MATCH (n:${tableLabel}) RETURN n.id AS id, n.name AS name, n.filePath AS filePath, n.startLine AS startLine, n.endLine AS endLine`;
+};
+
+const mapGraphNodeRow = (table: string, row: any, includeContent: boolean): GraphNode => ({
+  id: row.id ?? row[0],
+  label: table as GraphNode['label'],
+  properties: {
+    name: row.name ?? row.label ?? row[1],
+    filePath: row.filePath ?? row[2],
+    startLine: row.startLine,
+    endLine: row.endLine,
+    content: includeContent ? row.content : undefined,
+    responseKeys: row.responseKeys,
+    errorKeys: row.errorKeys,
+    middleware: row.middleware,
+    heuristicLabel: row.heuristicLabel,
+    cohesion: row.cohesion,
+    symbolCount: row.symbolCount,
+    description: row.description,
+    processType: row.processType,
+    stepCount: row.stepCount,
+    communities: row.communities,
+    entryPointId: row.entryPointId,
+    terminalId: row.terminalId,
+  } as GraphNode['properties'],
+});
+
+const mapGraphRelationshipRow = (row: any): GraphRelationship => ({
+  id: `${row.sourceId}_${row.type}_${row.targetId}`,
+  type: row.type,
+  sourceId: row.sourceId,
+  targetId: row.targetId,
+  confidence: row.confidence,
+  reason: row.reason,
+  step: row.step,
+});
+
+export const streamGraphNdjson = async (
+  res: express.Response,
+  includeContent = false,
+  signal?: AbortSignal,
+): Promise<void> => {
+  for (const table of NODE_TABLES) {
+    try {
+      await streamQuery(getNodeQuery(table, includeContent), async (row) => {
+        await writeNdjsonRecord(
+          res,
+          {
+            type: 'node',
+            data: mapGraphNodeRow(table, row, includeContent),
+          },
+          signal,
+        );
+      });
+    } catch (err) {
+      if (!isIgnorableGraphQueryError(err)) {
+        throw err;
+      }
+    }
+  }
+
+  await streamQuery(GRAPH_RELATIONSHIP_QUERY, async (row) => {
+    await writeNdjsonRecord(
+      res,
+      {
+        type: 'relationship',
+        data: mapGraphRelationshipRow(row),
+      },
+      signal,
+    );
+  });
 };
 
 /**
@@ -180,7 +448,14 @@ const buildGraph = async (
  */
 const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManager) => {
   app.get(routePath, (req, res) => {
-    const job = jm.getJob(req.params.jobId);
+    let jobId: string;
+    try {
+      jobId = assertString(req.params.jobId, 'jobId');
+    } catch (err: any) {
+      res.status(err.status ?? 400).json({ error: err.message });
+      return;
+    }
+    const job = jm.getJob(jobId);
     if (!job) {
       res.status(404).json({ error: 'Job not found' });
       return;
@@ -226,7 +501,7 @@ const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManage
       try {
         eventId++;
         if (progress.phase === 'complete' || progress.phase === 'failed') {
-          const eventJob = jm.getJob(req.params.jobId);
+          const eventJob = jm.getJob(jobId);
           res.write(
             `id: ${eventId}\nevent: ${progress.phase}\ndata: ${JSON.stringify({
               repoName: eventJob?.repoName,
@@ -253,6 +528,9 @@ const mountSSEProgress = (app: express.Express, routePath: string, jm: JobManage
 };
 
 const statusFromError = (err: any): number => {
+  // Validation helpers throw BadRequestError / ForbiddenError with a typed
+  // .status field — honor it before falling back to message-string matching.
+  if (err instanceof BadRequestError) return err.status;
   const msg = String(err?.message ?? '');
   if (msg.includes('No indexed repositories') || msg.includes('not found')) return 404;
   if (msg.includes('Multiple repositories')) return 400;
@@ -270,9 +548,157 @@ const requestedRepo = (req: express.Request): string | undefined => {
   return undefined;
 };
 
+/**
+ * Handle a GET /api/file request body. Extracted from createServer's route
+ * registration so it can be unit-tested without spinning up an HTTP server
+ * — calling app.get(...) inside a test triggers CodeQL's
+ * js/missing-rate-limiting query, which is appropriate for production
+ * route handlers but a false positive for tests of the handler logic.
+ *
+ * The function takes the express req and res (typed loosely so test code
+ * can pass minimal mocks) plus the resolved repo path. All path-traversal
+ * containment is done inline at the readFile sink with the canonical
+ * path.relative idiom for CodeQL js/path-injection recognition.
+ */
+export const handleFileRequest = async (
+  req: { query: any },
+  res: {
+    status: (code: number) => { json: (body: any) => void };
+    json: (body: any) => void;
+  },
+  repoPath: string,
+): Promise<void> => {
+  try {
+    // Type-confusion guard — req.query.path is `string | string[] | ParsedQs`.
+    // Without this, an attacker could pass `?path=a&path=b` to bypass the
+    // length-bound traversal check below (CodeQL js/type-confusion-through-
+    // parameter-tampering, same class as the /api/grep critical fix).
+    const rawFilePath = req.query.path;
+    if (rawFilePath === undefined || rawFilePath === '') {
+      res.status(400).json({ error: 'Missing path' });
+      return;
+    }
+    const filePath = assertString(rawFilePath, 'path');
+
+    // Path-injection containment — inline at the sink with the canonical
+    // path.relative idiom that CodeQL's js/path-injection sanitizer
+    // recognizes. assertSafePath in validation.ts performs the equivalent
+    // check, but cross-module helpers are not followed by CodeQL's
+    // interprocedural analysis for path-traversal sanitization in JS, so
+    // the barrier must be visible inline at the readFile sink.
+    const repoRoot = path.resolve(repoPath);
+    const fullPath = path.resolve(repoRoot, filePath);
+    const fullRel = path.relative(repoRoot, fullPath);
+    if (fullRel.startsWith('..') || path.isAbsolute(fullRel)) {
+      res.status(403).json({ error: 'Path traversal denied' });
+      return;
+    }
+
+    const raw = await fs.readFile(fullPath, 'utf-8');
+
+    // Optional line-range support: ?startLine=10&endLine=50
+    // Returns only the requested slice (0-indexed), plus metadata.
+    const startLine = req.query.startLine !== undefined ? Number(req.query.startLine) : undefined;
+    const endLine = req.query.endLine !== undefined ? Number(req.query.endLine) : undefined;
+
+    if (startLine !== undefined && Number.isFinite(startLine)) {
+      const lines = raw.split('\n');
+      const start = Math.max(0, startLine);
+      const end =
+        endLine !== undefined && Number.isFinite(endLine)
+          ? Math.min(lines.length, endLine + 1)
+          : lines.length;
+      res.json({
+        content: lines.slice(start, end).join('\n'),
+        startLine: start,
+        endLine: end - 1,
+        totalLines: lines.length,
+      });
+    } else {
+      res.json({ content: raw, totalLines: raw.split('\n').length });
+    }
+  } catch (err: any) {
+    if (err.code === 'ENOENT') {
+      res.status(404).json({ error: 'File not found' });
+    } else {
+      // statusFromError returns err.status for BadRequestError / ForbiddenError
+      // (assertString → 400 on array-form ?path=a&path=b; ForbiddenError → 403
+      // on traversal). Falls back to 500 for unrecognized failures.
+      res.status(statusFromError(err)).json({ error: err.message || 'Failed to read file' });
+    }
+  }
+};
+
+export const handleQueryRequest = async (
+  req: express.Request,
+  res: express.Response,
+  resolveRepo: (repoName?: string) => Promise<{ storagePath: string } | undefined>,
+): Promise<void> => {
+  try {
+    const cypher = req.body.cypher as string;
+    if (!cypher) {
+      res.status(400).json({ error: 'Missing "cypher" in request body' });
+      return;
+    }
+    const queryParams = req.body.params;
+    if (queryParams !== undefined && !isValidQueryParams(queryParams)) {
+      res.status(400).json({
+        error: '"params" must be a plain object with scalar values (string/number/boolean/null)',
+      });
+      return;
+    }
+
+    const entry = await resolveRepo(requestedRepo(req));
+    if (!entry) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
+    }
+    const lbugPath = path.join(entry.storagePath, 'lbug');
+    const result = await withLbugDb(lbugPath, () => executePrepared(cypher, queryParams ?? {}), {
+      readOnly: true,
+    });
+    res.json({ result });
+  } catch (err: any) {
+    if (isReadOnlyDbError(err)) {
+      res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
+      return;
+    }
+    res.status(500).json({ error: err.message || 'Query failed' });
+  }
+};
+
 export const createServer = async (port: number, host: string = '127.0.0.1') => {
   const app = express();
   app.disable('x-powered-by');
+
+  // Trust X-Forwarded-* headers only when the connection comes from the
+  // local loopback or RFC1918 private/link-local addresses — exactly the
+  // origins the CORS allowlist accepts. Without this, every request behind
+  // any reverse proxy / Docker bridge counts as the same `req.ip` and a
+  // single user can trip the per-IP rate limiter for everyone.
+  //
+  // SCOPE: this setting is process-wide. Every middleware and route in this
+  // Express app sees req.ip resolved from X-Forwarded-For when the upstream
+  // hop is in the trusted set above — not just the rate-limited routes.
+  // Future IP-based middleware (audit logging, IP-bound authz) inherits this
+  // behavior.
+  //
+  // CLOUD-DEPLOY CAVEAT: a public cloud LB (AWS ALB, Cloudflare, Fly.io
+  // edge, CGNAT 100.64/10) is NOT in the trusted set. In those topologies
+  // req.ip will collapse to the LB hop IP for every request and the per-IP
+  // rate limiter degrades to per-server. Add an explicit env-var override
+  // and document the cloud-deploy story before binding to a non-loopback
+  // host in those topologies (tracked as a follow-up; not blocking for the
+  // local-bound default).
+  app.set('trust proxy', 'loopback, linklocal, uniquelocal');
+
+  // Chromium Private Network Access (required since Chrome 130+). Must run before
+  // cors: the cors middleware ends OPTIONS preflight responses, so this header
+  // has to be set on res before cors writes the preflight reply.
+  app.use((_req, res, next) => {
+    res.setHeader('Access-Control-Allow-Private-Network', 'true');
+    next();
+  });
 
   // CORS: allow localhost, private/LAN networks, and the deployed site.
   // Non-browser requests (curl, server-to-server) have no origin and are allowed.
@@ -287,6 +713,12 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     }),
   );
   app.use(express.json({ limit: '10mb' }));
+
+  // No explicit OPTIONS route is registered. The Chromium Private Network
+  // Access header is set by the global middleware above (pre-cors), and
+  // `cors()` itself handles OPTIONS preflights for every path. Registering a
+  // wildcard OPTIONS catchall here would throw under Express 5's stricter
+  // path parser (the source of the original startup crash this branch fixed).
 
   // Initialize MCP backend (multi-repo, shared across all MCP sessions)
   const backend = new LocalBackend();
@@ -310,13 +742,101 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     activeRepoPaths.delete(repoPath);
   };
 
-  // Helper: resolve a repo by name from the global registry, or default to first
-  const resolveRepo = async (repoName?: string) => {
+  /**
+   * Maximum time the hold-queue will wait for an active analysis job to complete.
+   * Must stay in sync with the frontend's `fetchRepoInfo({ awaitAnalysis: true })` timeout.
+   */
+  const HOLD_QUEUE_TIMEOUT_SECS = 300; // 5 minutes
+
+  // Helper: resolve a repo by name from the global registry, or default to first.
+  // Pass `req` to enable early exit if the client disconnects during the hold-queue wait.
+  const resolveRepo = async (repoName?: string, isRetry = false, req?: any): Promise<any> => {
     const repos = await listRegisteredRepos();
-    if (repos.length === 0) return null;
-    if (repoName) return repos.find((r) => r.name === repoName) || null;
-    return repos[0]; // default to first
+    let found = null;
+
+    // Normalize: if a full path is passed, extract just the basename.
+    // e.g. "C:\Users\LENOVO\.gitnexus\repos\todo.txt-cli" -> "todo.txt-cli"
+    const normalizedName = repoName ? path.basename(repoName) : undefined;
+
+    if (normalizedName) {
+      found =
+        repos.find((r) => r.name === normalizedName) ||
+        repos.find((r) => r.name.toLowerCase() === normalizedName.toLowerCase()) ||
+        null;
+    } else if (repos.length > 0) {
+      found = repos[0]; // default to first repo
+    }
+
+    // If not yet in the registry, check whether a background job is actively cloning or
+    // analyzing this repo. Hold the connection open (up to 5 minutes) until it completes.
+    // We only wait for in-progress jobs ('queued'|'cloning'|'analyzing') — a 'complete' job
+    // whose repo is still missing means the registry sync failed; the fallback below handles it.
+    if (!found && normalizedName) {
+      const lower = normalizedName.toLowerCase();
+
+      // Track client disconnect to cancel the wait early
+      let clientGone = false;
+      req?.on('close', () => {
+        clientGone = true;
+      });
+
+      for (const job of jobManager.listJobs()) {
+        const isMatch =
+          job.repoName?.toLowerCase() === lower ||
+          (job.repoUrl && path.basename(job.repoUrl).replace('.git', '').toLowerCase() === lower) ||
+          (job.repoPath && path.basename(job.repoPath).toLowerCase() === lower);
+
+        if (isMatch && ['queued', 'cloning', 'analyzing'].includes(job.status)) {
+          if (process.env.DEBUG) {
+            // Sanitize user-controlled values to prevent log injection (CodeQL js/log-injection).
+            logger.debug(
+              {
+                jobId: String(job.id).replace(/[\r\n]/g, ' '),
+                repoName: String(normalizedName).replace(/[\r\n]/g, ' '),
+              },
+              '[debug] resolveRepo waiting for active job',
+            );
+          }
+          for (let wait = 0; wait < HOLD_QUEUE_TIMEOUT_SECS; wait++) {
+            if (clientGone) return null; // client disconnected — stop polling
+            const currentJob = jobManager.getJob(job.id);
+            if (!currentJob || currentJob.status === 'failed') break;
+            if (currentJob.status === 'complete') {
+              await backend.init();
+              const freshRepos = await listRegisteredRepos();
+              return freshRepos.find((r) => r.name === normalizedName) || null;
+            }
+            await new Promise((r) => setTimeout(r, 1000));
+          }
+          // Timed out — signal to the caller with a specific message
+          return { __timedOut: true, repoName: normalizedName };
+        }
+      }
+    }
+
+    // Emergency fallback: re-sync the registry to handle Windows file-system race conditions
+    // (e.g. registry file not yet flushed after clone completes).
+    if (!found && normalizedName && !isRetry) {
+      if (process.env.DEBUG) {
+        // Sanitize user-controlled values to prevent log injection (CodeQL js/log-injection).
+        logger.debug(
+          { repoName: String(normalizedName).replace(/[\r\n]/g, ' ') },
+          '[debug] resolveRepo 404, triggering deep init',
+        );
+      }
+      await backend.init();
+      return await resolveRepo(normalizedName, true, req);
+    }
+
+    return found;
   };
+
+  // Lightweight healthcheck for Docker/orchestrator probes (#1147).
+  // Returns immediately so container managers do not confuse a long-lived
+  // SSE stream with an unhealthy server.
+  app.get('/api/health', (_req, res) => {
+    res.json({ status: 'ok' });
+  });
 
   // SSE heartbeat — clients connect to detect server liveness instantly.
   // When the server shuts down, the TCP connection drops and the client's
@@ -378,9 +898,16 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // Get repo info
   app.get('/api/repo', async (req, res) => {
     try {
-      const entry = await resolveRepo(requestedRepo(req));
+      const entry = await resolveRepo(requestedRepo(req), false, req);
       if (!entry) {
         res.status(404).json({ error: 'Repository not found. Run: gitnexus analyze' });
+        return;
+      }
+      // Timed out waiting for an active analysis job
+      if (entry.__timedOut) {
+        res.status(503).json({
+          error: `Repository analysis for "${entry.repoName}" is taking longer than expected. Please try again in a moment.`,
+        });
         return;
       }
       const meta = await loadMeta(entry.storagePath);
@@ -396,7 +923,10 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   });
 
   // Delete a repo — removes index, clone dir (if any), and unregisters it
-  app.delete('/api/repo', async (req, res) => {
+  // Rate-limited (CodeQL js/missing-rate-limiting): destructive operation
+  // doing fs.rm of clone + storage dirs. Default 60 rpm/IP is generous for
+  // delete; tighten if abuse is observed.
+  app.delete('/api/repo', createRouteLimiter(), async (req, res) => {
     try {
       const repoName = requestedRepo(req);
       if (!repoName) {
@@ -427,15 +957,26 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
         const storagePath = getStoragePath(entry.path);
         await fs.rm(storagePath, { recursive: true, force: true }).catch(() => {});
 
-        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/
-        const cloneDir = getCloneDir(entry.name);
+        // 2. Delete the cloned repo dir if it lives under ~/.gitnexus/repos/.
+        // getCloneDir now throws on names that are not filesystem-safe (e.g.
+        // local repos registered with names like "my project" or "org/repo").
+        // Such repos legitimately have no clone dir, so treat the rejection as
+        // "nothing to clean up" rather than letting it fail the delete handler.
+        let cloneDir: string | null = null;
         try {
-          const stat = await fs.stat(cloneDir);
-          if (stat.isDirectory()) {
-            await fs.rm(cloneDir, { recursive: true, force: true });
-          }
+          cloneDir = getCloneDir(entry.name);
         } catch {
-          /* clone dir may not exist (local repos) */
+          /* repo name not eligible for a clone dir (local repo) */
+        }
+        if (cloneDir) {
+          try {
+            const stat = await fs.stat(cloneDir);
+            if (stat.isDirectory()) {
+              await fs.rm(cloneDir, { recursive: true, force: true });
+            }
+          } catch {
+            /* clone dir may not exist */
+          }
         }
 
         // 3. Unregister from the global registry
@@ -464,38 +1005,76 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       }
       const lbugPath = path.join(entry.storagePath, 'lbug');
       const includeContent = req.query.includeContent === 'true';
-      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent));
+      const stream = req.query.stream === 'true';
+
+      if (stream) {
+        const abortController = new AbortController();
+        let responseFinished = false;
+        const markFinished = () => {
+          responseFinished = true;
+        };
+        const abortStreaming = () => {
+          if (!responseFinished) {
+            abortController.abort();
+          }
+        };
+
+        res.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.flushHeaders();
+
+        req.once('aborted', abortStreaming);
+        res.once('finish', markFinished);
+        res.once('close', abortStreaming);
+
+        try {
+          // Read-only open: /api/graph never writes. Write-mode opens engage
+          // LadybugDB's checkpoint machinery (`.shadow` sidecar), which on
+          // Windows races with the OS file handle release and trips
+          // "Cannot open file ... lbug.shadow - Error 2". See pool-adapter.ts
+          // which already opens read-only for the same reason, and the
+          // /api/query precedent in PR #1655.
+          await withLbugDb(
+            lbugPath,
+            async () => streamGraphNdjson(res, includeContent, abortController.signal),
+            { readOnly: true },
+          );
+          if (!abortController.signal.aborted && !res.writableEnded) {
+            res.end();
+          }
+        } finally {
+          req.off('aborted', abortStreaming);
+          res.off('finish', markFinished);
+          res.off('close', abortStreaming);
+        }
+        return;
+      }
+
+      const graph = await withLbugDb(lbugPath, async () => buildGraph(includeContent), {
+        readOnly: true,
+      });
       res.json(graph);
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Failed to build graph' });
+      if (err instanceof ClientDisconnectedError) {
+        return;
+      }
+      const message = err.message || 'Failed to build graph';
+      if (res.headersSent) {
+        try {
+          res.write(JSON.stringify({ type: 'error', error: message }) + '\n');
+        } catch {
+          // Best-effort only after streaming has started.
+        }
+        res.end();
+        return;
+      }
+      res.status(500).json({ error: message });
     }
   });
 
   // Execute Cypher query
   app.post('/api/query', async (req, res) => {
-    try {
-      const cypher = req.body.cypher as string;
-      if (!cypher) {
-        res.status(400).json({ error: 'Missing "cypher" in request body' });
-        return;
-      }
-
-      if (isWriteQuery(cypher)) {
-        res.status(403).json({ error: 'Write queries are not allowed via the HTTP API' });
-        return;
-      }
-
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-      const lbugPath = path.join(entry.storagePath, 'lbug');
-      const result = await withLbugDb(lbugPath, () => executeQuery(cypher));
-      res.json({ result });
-    } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Query failed' });
-    }
+    await handleQueryRequest(req, res, resolveRepo);
   });
 
   // Search (supports mode: 'hybrid' | 'semantic' | 'bm25', and optional enrichment)
@@ -520,64 +1099,70 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       const mode: string = req.body.mode ?? 'hybrid';
       const enrich: boolean = req.body.enrich !== false; // default true
 
-      const results = await withLbugDb(lbugPath, async () => {
-        let searchResults: any[];
+      const results = await withLbugDb(
+        lbugPath,
+        async () => {
+          let searchResults: any[];
+          let ftsAvailable: boolean | undefined;
 
-        if (mode === 'semantic') {
-          const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
-          if (!isEmbedderReady()) {
-            return [] as any[];
-          }
-          const { semanticSearch: semSearch } =
-            await import('../core/embeddings/embedding-pipeline.js');
-          searchResults = await semSearch(executeQuery, query, limit);
-          // Normalize semantic results to HybridSearchResult shape
-          searchResults = searchResults.map((r: any, i: number) => ({
-            ...r,
-            score: r.score ?? 1 - (r.distance ?? 0),
-            rank: i + 1,
-            sources: ['semantic'],
-          }));
-        } else if (mode === 'bm25') {
-          searchResults = await searchFTSFromLbug(query, limit);
-          searchResults = searchResults.map((r: any, i: number) => ({
-            ...r,
-            rank: i + 1,
-            sources: ['bm25'],
-          }));
-        } else {
-          // hybrid (default)
-          const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
-          if (isEmbedderReady()) {
+          if (mode === 'semantic') {
+            const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
+            if (!isEmbedderReady()) {
+              return { searchResults: [] as any[], ftsAvailable: undefined };
+            }
             const { semanticSearch: semSearch } =
               await import('../core/embeddings/embedding-pipeline.js');
-            searchResults = await hybridSearch(query, limit, executeQuery, semSearch);
+            searchResults = await semSearch(executeQuery, query, limit);
+            // Normalize semantic results to HybridSearchResult shape
+            searchResults = searchResults.map((r: any, i: number) => ({
+              ...r,
+              score: r.score ?? 1 - (r.distance ?? 0),
+              rank: i + 1,
+              sources: ['semantic'],
+            }));
+          } else if (mode === 'bm25') {
+            const ftsResponse = await searchFTSFromLbug(query, limit);
+            ftsAvailable = ftsResponse.ftsAvailable;
+            searchResults = ftsResponse.results.map((r: any, i: number) => ({
+              ...r,
+              rank: i + 1,
+              sources: ['bm25'],
+            }));
           } else {
-            searchResults = await searchFTSFromLbug(query, limit);
+            // hybrid (default)
+            const { isEmbedderReady } = await import('../core/embeddings/embedder.js');
+            if (isEmbedderReady()) {
+              const { semanticSearch: semSearch } =
+                await import('../core/embeddings/embedding-pipeline.js');
+              searchResults = await hybridSearch(query, limit, executeQuery, semSearch);
+            } else {
+              const ftsResponse = await searchFTSFromLbug(query, limit);
+              ftsAvailable = ftsResponse.ftsAvailable;
+              searchResults = ftsResponse.results;
+            }
           }
-        }
 
-        if (!enrich) return searchResults;
+          if (!enrich) return { searchResults, ftsAvailable };
 
-        // Server-side enrichment: add connections, cluster, processes per result
-        // Uses parameterized queries to prevent Cypher injection via nodeId
-        const validLabel = (label: string): boolean =>
-          (NODE_TABLES as readonly string[]).includes(label);
+          // Server-side enrichment: add connections, cluster, processes per result
+          // Uses parameterized queries to prevent Cypher injection via nodeId
+          const validLabel = (label: string): boolean =>
+            (NODE_TABLES as readonly string[]).includes(label);
 
-        const enriched = await Promise.all(
-          searchResults.slice(0, limit).map(async (r: any) => {
-            const nodeId: string = r.nodeId || r.id || '';
-            const nodeLabel = nodeId.split(':')[0];
-            const enrichment: { connections?: any; cluster?: string; processes?: any[] } = {};
+          const enriched = await Promise.all(
+            searchResults.slice(0, limit).map(async (r: any) => {
+              const nodeId: string = r.nodeId || r.id || '';
+              const nodeLabel = nodeId.split(':')[0];
+              const enrichment: { connections?: any; cluster?: string; processes?: any[] } = {};
 
-            if (!nodeId || !validLabel(nodeLabel)) return { ...r, ...enrichment };
+              if (!nodeId || !validLabel(nodeLabel)) return { ...r, ...enrichment };
 
-            // Run connections, cluster, and process queries in parallel
-            // Label is validated against NODE_TABLES (compile-time safe identifiers);
-            // nodeId uses $nid parameter binding to prevent injection
-            const [connRes, clusterRes, procRes] = await Promise.all([
-              executePrepared(
-                `
+              // Run connections, cluster, and process queries in parallel
+              // Label is validated against NODE_TABLES (compile-time safe identifiers);
+              // nodeId uses $nid parameter binding to prevent injection
+              const [connRes, clusterRes, procRes] = await Promise.all([
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               OPTIONAL MATCH (n)-[r1:CodeRelation]->(dst)
               OPTIONAL MATCH (src)-[r2:CodeRelation]->(n)
@@ -586,146 +1171,127 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 collect(DISTINCT {name: src.name, type: r2.type, confidence: r2.confidence}) AS incoming
               LIMIT 1
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-              executePrepared(
-                `
+                  { nid: nodeId },
+                ).catch(() => []),
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               MATCH (n)-[:CodeRelation {type: 'MEMBER_OF'}]->(c:Community)
               RETURN c.label AS label, c.description AS description
               LIMIT 1
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-              executePrepared(
-                `
+                  { nid: nodeId },
+                ).catch(() => []),
+                executePrepared(
+                  `
               MATCH (n:${nodeLabel} {id: $nid})
               MATCH (n)-[rel:CodeRelation {type: 'STEP_IN_PROCESS'}]->(p:Process)
               RETURN p.id AS id, p.label AS label, rel.step AS step, p.stepCount AS stepCount
               ORDER BY rel.step
             `,
-                { nid: nodeId },
-              ).catch(() => []),
-            ]);
+                  { nid: nodeId },
+                ).catch(() => []),
+              ]);
 
-            if (connRes.length > 0) {
-              const row = connRes[0];
-              const outgoing = (Array.isArray(row) ? row[0] : row.outgoing || [])
-                .filter((c: any) => c?.name)
-                .slice(0, 5);
-              const incoming = (Array.isArray(row) ? row[1] : row.incoming || [])
-                .filter((c: any) => c?.name)
-                .slice(0, 5);
-              enrichment.connections = { outgoing, incoming };
-            }
+              if (connRes.length > 0) {
+                const row = connRes[0];
+                const outgoing = (Array.isArray(row) ? row[0] : row.outgoing || [])
+                  .filter((c: any) => c?.name)
+                  .slice(0, 5);
+                const incoming = (Array.isArray(row) ? row[1] : row.incoming || [])
+                  .filter((c: any) => c?.name)
+                  .slice(0, 5);
+                enrichment.connections = { outgoing, incoming };
+              }
 
-            if (clusterRes.length > 0) {
-              const row = clusterRes[0];
-              enrichment.cluster = Array.isArray(row) ? row[0] : row.label;
-            }
+              if (clusterRes.length > 0) {
+                const row = clusterRes[0];
+                enrichment.cluster = Array.isArray(row) ? row[0] : row.label;
+              }
 
-            if (procRes.length > 0) {
-              enrichment.processes = procRes
-                .map((row: any) => ({
-                  id: Array.isArray(row) ? row[0] : row.id,
-                  label: Array.isArray(row) ? row[1] : row.label,
-                  step: Array.isArray(row) ? row[2] : row.step,
-                  stepCount: Array.isArray(row) ? row[3] : row.stepCount,
-                }))
-                .filter((p: any) => p.id && p.label);
-            }
+              if (procRes.length > 0) {
+                enrichment.processes = procRes
+                  .map((row: any) => ({
+                    id: Array.isArray(row) ? row[0] : row.id,
+                    label: Array.isArray(row) ? row[1] : row.label,
+                    step: Array.isArray(row) ? row[2] : row.step,
+                    stepCount: Array.isArray(row) ? row[3] : row.stepCount,
+                  }))
+                  .filter((p: any) => p.id && p.label);
+              }
 
-            return { ...r, ...enrichment };
-          }),
-        );
+              return { ...r, ...enrichment };
+            }),
+          );
 
-        return enriched;
-      });
-      res.json({ results });
+          return { searchResults: enriched, ftsAvailable };
+        },
+        { readOnly: true },
+      );
+      const response: any = { results: results.searchResults ?? results };
+      if (results.ftsAvailable === false) {
+        response.warning =
+          'FTS indexes missing — keyword search degraded. Run: gitnexus analyze --repair-fts (or gitnexus analyze --force) to rebuild indexes.';
+      }
+      res.json(response);
     } catch (err: any) {
       res.status(500).json({ error: err.message || 'Search failed' });
     }
   });
 
   // Read file — with path traversal guard
-  app.get('/api/file', async (req, res) => {
-    try {
-      const entry = await resolveRepo(requestedRepo(req));
-      if (!entry) {
-        res.status(404).json({ error: 'Repository not found' });
-        return;
-      }
-      const filePath = req.query.path as string;
-      if (!filePath) {
-        res.status(400).json({ error: 'Missing path' });
-        return;
-      }
-
-      // Prevent path traversal — resolve and verify the path stays within the repo root
-      const repoRoot = path.resolve(entry.path);
-      const fullPath = path.resolve(repoRoot, filePath);
-      if (!fullPath.startsWith(repoRoot + path.sep) && fullPath !== repoRoot) {
-        res.status(403).json({ error: 'Path traversal denied' });
-        return;
-      }
-
-      const raw = await fs.readFile(fullPath, 'utf-8');
-
-      // Optional line-range support: ?startLine=10&endLine=50
-      // Returns only the requested slice (0-indexed), plus metadata.
-      const startLine = req.query.startLine !== undefined ? Number(req.query.startLine) : undefined;
-      const endLine = req.query.endLine !== undefined ? Number(req.query.endLine) : undefined;
-
-      if (startLine !== undefined && Number.isFinite(startLine)) {
-        const lines = raw.split('\n');
-        const start = Math.max(0, startLine);
-        const end =
-          endLine !== undefined && Number.isFinite(endLine)
-            ? Math.min(lines.length, endLine + 1)
-            : lines.length;
-        res.json({
-          content: lines.slice(start, end).join('\n'),
-          startLine: start,
-          endLine: end - 1,
-          totalLines: lines.length,
-        });
-      } else {
-        res.json({ content: raw, totalLines: raw.split('\n').length });
-      }
-    } catch (err: any) {
-      if (err.code === 'ENOENT') {
-        res.status(404).json({ error: 'File not found' });
-      } else {
-        res.status(500).json({ error: err.message || 'Failed to read file' });
-      }
+  // Rate-limited (CodeQL js/missing-rate-limiting): per-request fs.readFile.
+  app.get('/api/file', createRouteLimiter(), async (req, res) => {
+    const entry = await resolveRepo(requestedRepo(req));
+    if (!entry) {
+      res.status(404).json({ error: 'Repository not found' });
+      return;
     }
+    await handleFileRequest(req, res, entry.path);
   });
 
   // Grep — regex search across file contents in the indexed repo
   // Uses filesystem-based search for memory efficiency (never loads all files into memory)
-  app.get('/api/grep', async (req, res) => {
+  // Rate-limited (CodeQL js/missing-rate-limiting): scans every file in
+  // the indexed repo per request — heaviest I/O endpoint. Same default 60
+  // rpm/IP for now; consider tightening if real-world load shows abuse.
+  app.get('/api/grep', createRouteLimiter(), async (req, res) => {
     try {
       const entry = await resolveRepo(requestedRepo(req));
       if (!entry) {
         res.status(404).json({ error: 'Repository not found' });
         return;
       }
-      const pattern = req.query.pattern as string;
-      if (!pattern) {
+      // Type-confusion guard (CodeQL js/type-confusion-through-parameter-tampering):
+      // req.query.pattern is `string | string[] | ParsedQs` — without an explicit
+      // type check, the `.length` guard below counts array elements instead of
+      // characters, allowing arbitrarily long patterns through.
+      const rawPattern = req.query.pattern;
+      if (rawPattern === undefined) {
+        res.status(400).json({ error: 'Missing "pattern" query parameter' });
+        return;
+      }
+      const pattern = assertString(rawPattern, 'pattern');
+      if (pattern.length === 0) {
         res.status(400).json({ error: 'Missing "pattern" query parameter' });
         return;
       }
 
-      // ReDoS protection: reject overly long or dangerous patterns
+      // Length cap: applies to both literal and regex modes as a defense-in-depth
+      // bound against pathological input.
       if (pattern.length > 200) {
         res.status(400).json({ error: 'Pattern too long (max 200 characters)' });
         return;
       }
 
-      // Validate regex syntax
+      // Treat user input as a literal substring in all cases to prevent
+      // regex-injection/ReDoS via attacker-controlled regex syntax.
+      const effectivePattern = escapeRegExp(pattern);
+
+      // Validate regex syntax (catches both opt-in user regex and any escapeRegExp bug)
       let regex: RegExp;
       try {
-        regex = new RegExp(pattern, 'gim');
+        regex = new RegExp(effectivePattern, 'gim');
       } catch {
         res.status(400).json({ error: 'Invalid regex pattern' });
         return;
@@ -741,8 +1307,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       // Get file paths from the graph (lightweight — no content loaded)
       const lbugPath = path.join(entry.storagePath, 'lbug');
-      const fileRows = await withLbugDb(lbugPath, () =>
-        executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
+      const fileRows = await withLbugDb(
+        lbugPath,
+        () =>
+          executeQuery(`MATCH (n:File) WHERE n.content IS NOT NULL RETURN n.filePath AS filePath`),
+        { readOnly: true },
       );
 
       // Search files on disk one at a time (constant memory)
@@ -773,7 +1342,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
 
       res.json({ results });
     } catch (err: any) {
-      res.status(500).json({ error: err.message || 'Grep failed' });
+      res.status(statusFromError(err)).json({ error: err.message || 'Grep failed' });
     }
   });
 
@@ -844,9 +1413,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   // ── Analyze API ──────────────────────────────────────────────────────
 
   // POST /api/analyze — start a new analysis job
-  app.post('/api/analyze', async (req, res) => {
+  app.post('/api/analyze', createRouteLimiter({ limit: 10 }), async (req, res) => {
     try {
-      const { url: repoUrl, path: repoLocalPath, force, embeddings } = req.body;
+      const { url: repoUrl, path: repoLocalPath, force, embeddings, dropEmbeddings } = req.body;
 
       // Input type validation
       if (repoUrl !== undefined && typeof repoUrl !== 'string') {
@@ -977,7 +1546,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                     });
                   })
                   .catch((err) => {
-                    console.error('backend.init() failed after analyze:', err);
+                    logger.error({ err }, 'backend.init() failed after analyze:');
                     jobManager.updateJob(job.id, {
                       status: 'failed',
                       error: 'Server failed to reload after analysis. Try again.',
@@ -1009,7 +1578,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
                 j.retryCount++;
                 const delay = 1000 * Math.pow(2, j.retryCount - 1); // 1s, 2s
                 const lastErr = stderrChunks.trim().split('\n').pop() || '';
-                console.warn(
+                logger.warn(
                   `Analyze worker crashed (code ${code}), retry ${j.retryCount}/${MAX_WORKER_RETRIES} in ${delay}ms` +
                     (lastErr ? `: ${lastErr}` : ''),
                 );
@@ -1040,7 +1609,11 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
             child.send({
               type: 'start',
               repoPath: targetPath,
-              options: { force: !!force, embeddings: !!embeddings },
+              options: {
+                force: !!force,
+                embeddings: !!embeddings,
+                dropEmbeddings: !!dropEmbeddings,
+              },
             });
           };
 
@@ -1107,7 +1680,7 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
   const embedJobManager = new JobManager();
 
   // POST /api/embed — trigger server-side embedding generation
-  app.post('/api/embed', async (req, res) => {
+  app.post('/api/embed', createRouteLimiter({ limit: 20 }), async (req, res) => {
     try {
       const entry = await resolveRepo(requestedRepo(req));
       if (!entry) {
@@ -1150,25 +1723,48 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
           await withLbugDb(lbugPath, async () => {
             const { runEmbeddingPipeline } =
               await import('../core/embeddings/embedding-pipeline.js');
-            await runEmbeddingPipeline(executeQuery, executeWithReusedStatement, (p) => {
-              embedJobManager.updateJob(job.id, {
-                progress: {
-                  phase:
-                    p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
-                  percent: p.percent,
-                  message:
-                    p.phase === 'loading-model'
-                      ? 'Loading embedding model...'
-                      : p.phase === 'embedding'
-                        ? `Embedding nodes (${p.percent}%)...`
-                        : p.phase === 'indexing'
-                          ? 'Creating vector index...'
-                          : p.phase === 'ready'
-                            ? 'Embeddings complete'
-                            : `${p.phase} (${p.percent}%)`,
-                },
-              });
-            });
+            // Fetch existing content hashes for incremental embedding.
+            // Delegated to lbug-adapter which owns the DB query logic and legacy-fallback handling.
+            const { fetchExistingEmbeddingHashes } = await import('../core/lbug/lbug-adapter.js');
+            const existingEmbeddings = await fetchExistingEmbeddingHashes(executeQuery);
+            if (existingEmbeddings && existingEmbeddings.size > 0) {
+              console.log(
+                `[embed] ${existingEmbeddings.size} nodes already embedded — incremental run with content-hash comparison`,
+              );
+            }
+            await runEmbeddingPipeline(
+              executeQuery,
+              executeWithReusedStatement,
+              (p) => {
+                embedJobManager.updateJob(job.id, {
+                  progress: {
+                    phase:
+                      p.phase === 'ready' ? 'complete' : p.phase === 'error' ? 'failed' : p.phase,
+                    percent: p.percent,
+                    message:
+                      p.phase === 'loading-model'
+                        ? 'Loading embedding model...'
+                        : p.phase === 'embedding'
+                          ? `Embedding nodes (${p.percent}%)...`
+                          : p.phase === 'indexing'
+                            ? 'Creating vector index...'
+                            : p.phase === 'ready'
+                              ? 'Embeddings complete'
+                              : `${p.phase} (${p.percent}%)`,
+                  },
+                });
+              },
+              {}, // config: use defaults
+              undefined, // skipNodeIds
+              undefined, // context
+              existingEmbeddings,
+            );
+
+            // Flush WAL so subsequent /api/search requests see the new
+            // embeddings immediately (#1149). In the CLI path closeLbug()
+            // handles this during process exit, but the server keeps the
+            // connection open for other routes — a CHECKPOINT is enough.
+            await flushWAL();
           });
 
           clearTimeout(embedTimeout);
@@ -1237,9 +1833,20 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     res.json({ id: job.id, status: 'failed', error: 'Cancelled by user' });
   });
 
+  // ── Web UI (served at root) ───────────────────────────────────────
+
+  // Resolve the gitnexus-web dist directory relative to this file's location.
+  // In the published package: <pkg>/dist/server/api.js → <pkg>/web/
+  // In dev (tsx):            gitnexus/src/server/api.ts → gitnexus-web/dist/
+  const __dirname = path.dirname(fileURLToPath(import.meta.url));
+  const webDistDir = path.resolve(__dirname, '..', '..', 'web');
+  const devWebDistDir = path.resolve(__dirname, '..', '..', '..', 'gitnexus-web', 'dist');
+  const staticDir = await resolveWebDistDir(webDistDir, devWebDistDir);
+  registerWebUI(app, staticDir);
+
   // Global error handler — catch anything the route handlers miss
   app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
-    console.error('Unhandled error:', err);
+    logger.error({ err }, 'Unhandled error:');
     res.status(500).json({ error: 'Internal server error' });
   });
 
@@ -1253,7 +1860,9 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
     });
     server.on('error', (err) => reject(err));
 
-    // Graceful shutdown — close Express + LadybugDB cleanly
+    // Graceful shutdown — close Express + LadybugDB cleanly. Pino's default
+    // destination is `sync: false` (buffered); `flushLoggerSync()` before
+    // `process.exit` so records emitted during cleanup reach stderr.
     const shutdown = async () => {
       console.log('\nShutting down...');
       server.close();
@@ -1262,9 +1871,33 @@ export const createServer = async (port: number, host: string = '127.0.0.1') => 
       await cleanupMcp();
       await closeLbug();
       await backend.disconnect();
+      const { flushLoggerSync } = await import('../core/logger.js');
+      flushLoggerSync();
       process.exit(0);
     };
     process.once('SIGINT', shutdown);
     process.once('SIGTERM', shutdown);
+
+    // Catch-all crash guards (mirrors startMCPServer in mcp/server.ts).
+    // Pino v10's default destination is buffered (`sync: false`) — call
+    // `flushLoggerSync()` after logging and before triggering shutdown
+    // so the crash record reaches stderr regardless of how cleanup goes.
+    // Worker-thread transports (pino-pretty under TTY) handle their own
+    // flush on process exit in v10. `pino.final` was removed in v10
+    // because the new transport architecture made it unnecessary.
+    let shuttingDown = false;
+    process.on('uncaughtException', (err) => {
+      logger.error({ err }, 'GitNexus uncaughtException');
+      flushLoggerSync();
+      if (!shuttingDown) {
+        shuttingDown = true;
+        shutdown().catch(() => {});
+      }
+    });
+    process.on('unhandledRejection', (reason: unknown) => {
+      // Availability-first: log the rejection without exiting.
+      const err = reason instanceof Error ? reason : new Error(String(reason));
+      logger.error({ err }, 'GitNexus unhandledRejection');
+    });
   });
 };

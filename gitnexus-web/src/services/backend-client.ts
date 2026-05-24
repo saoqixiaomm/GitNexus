@@ -7,6 +7,7 @@
  */
 
 import type { GraphNode, GraphRelationship } from 'gitnexus-shared';
+import { CircuitOpenError, ResilientFetchExhaustedError, resilientFetch } from 'gitnexus-shared';
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -72,7 +73,19 @@ export class BackendError extends Error {
   constructor(
     message: string,
     public readonly status: number,
-    public readonly code: 'network' | 'server' | 'client' | 'not_found' | 'timeout',
+    public readonly code:
+      | 'network'
+      | 'server'
+      | 'client'
+      | 'not_found'
+      | 'timeout'
+      | 'rate_limited',
+    /**
+     * Milliseconds until the caller should retry. Populated for rate-limited
+     * responses (HTTP 429) from the server's `Retry-After` header. `undefined`
+     * for every other code, including `client` errors that aren't 429.
+     */
+    public readonly retryAfterMs?: number,
   ) {
     super(message);
     this.name = 'BackendError';
@@ -192,8 +205,32 @@ export function streamSSE<T = unknown>(url: string, handlers: SSEHandlers<T>): A
 
 let _backendUrl = 'http://localhost:4747';
 
+/**
+ * Validate that a backend URL is a safe http:// or https:// origin before
+ * storing it as the fetch target base (CodeQL js/client-side-request-forgery).
+ *
+ * Throws if the URL uses a non-HTTP scheme (e.g. javascript:, data:, file://).
+ * All other well-formed http/https URLs are accepted — the client intentionally
+ * supports connecting to remote GitNexus servers, not just localhost.
+ */
+export function validateBackendUrl(url: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    // Do not echo raw input — it may contain credentials.
+    throw new Error('Invalid backend URL: must be a well-formed http:// or https:// URL');
+  }
+  if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+    // Use parsed.protocol only (scheme), not the full URL, to avoid leaking credentials.
+    throw new Error(`Backend URL must use http:// or https:// (got ${parsed.protocol})`);
+  }
+}
+
 export const setBackendUrl = (url: string): void => {
-  _backendUrl = url.replace(/\/$/, '');
+  const trimmed = url.replace(/\/$/, '');
+  validateBackendUrl(trimmed);
+  _backendUrl = trimmed;
 };
 
 export const getBackendUrl = (): string => _backendUrl;
@@ -222,31 +259,93 @@ export function normalizeServerUrl(input: string): string {
 
 // ── Internal Helpers ───────────────────────────────────────────────────────
 
-const DEFAULT_TIMEOUT_MS = 10_000;
+const DEFAULT_TIMEOUT_MS = 30_000;
 const PROBE_TIMEOUT_MS = 2_000;
+
+/** Idempotent HTTP methods. Other verbs (POST, PATCH, PUT, DELETE) get
+ *  a single-attempt retry budget by default to avoid duplicate side
+ *  effects on retry — a POST that 5xx'd may have already executed
+ *  server-side. Callers that have idempotency keys or otherwise know
+ *  their mutation is safe to retry can opt in via `forceRetry`. */
+const IDEMPOTENT_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
 
 const fetchWithTimeout = async (
   url: string,
   init: RequestInit = {},
   timeoutMs: number = DEFAULT_TIMEOUT_MS,
+  /**
+   * Force a retry budget on non-idempotent methods. Default false.
+   * Pass true only when the endpoint is known-idempotent (e.g. DELETE
+   * of a known-deleted resource — second call is a 404 / no-op) AND
+   * the duplicate-side-effect window is acceptable.
+   */
+  forceRetry = false,
 ): Promise<Response> => {
-  const controller = new AbortController();
-  // Merge external signal if provided
+  // Merge the external caller signal (if any) with an
+  // `AbortSignal.timeout()` so a timer-fired abort produces a
+  // `DOMException` with `name === 'TimeoutError'` — which
+  // `resilientFetch` correctly classifies as terminal-network (no
+  // retry, no breaker hit). A manual `AbortController.abort()` would
+  // produce `name === 'AbortError'` and route through the
+  // retryable-network branch, which mis-penalizes the breaker for
+  // user-side network slowness.
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
   const externalSignal = init.signal;
-  if (externalSignal) {
-    externalSignal.addEventListener('abort', () => controller.abort());
+  const signal = externalSignal ? AbortSignal.any([timeoutSignal, externalSignal]) : timeoutSignal;
+
+  const method = (init.method ?? 'GET').toUpperCase();
+  const isIdempotent = IDEMPOTENT_METHODS.has(method);
+  const maxAttempts = isIdempotent || forceRetry ? 2 : 1;
+
+  // Key the breaker by the current backend origin so switching backend
+  // URLs (e.g. recovering from a flapping local server by pointing at
+  // a different host) gives the new origin a fresh breaker state. A
+  // single shared `'web-backend'` key would otherwise leave a user
+  // locked out for the full cooldown after one bad host trips the
+  // circuit. The malformed-URL fallback is defensive — `setBackendUrl`
+  // normalizes input, so this branch shouldn't fire in practice.
+  let breakerKey: string;
+  try {
+    breakerKey = `web-backend:${new URL(_backendUrl).origin}`;
+  } catch {
+    breakerKey = 'web-backend:invalid';
   }
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
-    const response = await fetch(url, { ...init, signal: controller.signal });
+    // Bounded retries + 5xx/429 handling are delegated to resilientFetch.
+    // Method-aware budget: idempotent verbs retry once on transient
+    // backend failures; mutations (POST/PATCH/PUT/DELETE) default to
+    // single-attempt to avoid duplicate side effects.
+    const response = await resilientFetch(
+      url,
+      { ...init, signal },
+      {
+        breakerKey,
+        retry: { maxAttempts, baseDelayMs: 250, capDelayMs: 1500 },
+      },
+    );
     return response;
   } catch (error: unknown) {
-    if (error instanceof DOMException && error.name === 'AbortError') {
-      if (externalSignal?.aborted) {
-        throw new BackendError('Request aborted', 0, 'network');
-      }
+    if (error instanceof CircuitOpenError) {
+      throw new BackendError(
+        `GitNexus backend at ${_backendUrl} is unhealthy; retry in ${Math.ceil(error.retryAfterMs / 1000)}s`,
+        0,
+        'network',
+      );
+    }
+    if (error instanceof ResilientFetchExhaustedError) {
+      // Fall through to caller — surface the raw response so assertOk
+      // can craft the BackendError with the right code.
+      return error.response;
+    }
+    if (error instanceof DOMException && error.name === 'TimeoutError') {
       throw new BackendError(`Request to ${url} timed out after ${timeoutMs}ms`, 0, 'timeout');
+    }
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      // External caller-driven cancellation — `timeoutSignal` would
+      // have surfaced as TimeoutError above, so this branch covers
+      // only the externally-aborted case.
+      throw new BackendError('Request aborted', 0, 'network');
     }
     if (error instanceof TypeError) {
       throw new BackendError(
@@ -256,19 +355,19 @@ const fetchWithTimeout = async (
       );
     }
     throw error;
-  } finally {
-    clearTimeout(timer);
   }
 };
 
 const assertOk = async (response: Response): Promise<void> => {
   if (response.ok) return;
 
-  let message = `Backend returned ${response.status} ${response.statusText}`;
+  let message = response.statusText;
   try {
     const body = await response.json();
     if (body && typeof body.error === 'string') {
       message = body.error;
+    } else if (body && typeof body.message === 'string') {
+      message = body.message;
     }
   } catch {
     // Response body was not JSON
@@ -277,10 +376,32 @@ const assertOk = async (response: Response): Promise<void> => {
   const code =
     response.status === 404
       ? 'not_found'
-      : response.status >= 400 && response.status < 500
-        ? 'client'
-        : 'server';
-  throw new BackendError(message, response.status, code);
+      : response.status === 429
+        ? 'rate_limited'
+        : response.status >= 400 && response.status < 500
+          ? 'client'
+          : 'server';
+
+  // Retry-After is the standard HTTP signal for when the client may try again.
+  // express-rate-limit emits it on 429 with seconds (integer) or HTTP-date.
+  // We accept both shapes; an unparseable header yields undefined retryAfterMs.
+  let retryAfterMs: number | undefined;
+  if (response.status === 429) {
+    const header = response.headers.get('retry-after');
+    if (header) {
+      const seconds = Number(header);
+      if (Number.isFinite(seconds) && seconds >= 0) {
+        retryAfterMs = seconds * 1000;
+      } else {
+        const dateMs = Date.parse(header);
+        if (Number.isFinite(dateMs)) {
+          retryAfterMs = Math.max(0, dateMs - Date.now());
+        }
+      }
+    }
+  }
+
+  throw new BackendError(message, response.status, code, retryAfterMs);
 };
 
 const repoParam = (repo?: string): string => (repo ? `repo=${encodeURIComponent(repo)}` : '');
@@ -386,10 +507,22 @@ export const fetchRepos = async (): Promise<BackendRepo[]> => {
   return response.json() as Promise<BackendRepo[]>;
 };
 
-/** Fetch repo metadata. */
-export const fetchRepoInfo = async (repo?: string): Promise<BackendRepo> => {
+/** Fetch repo metadata.
+ * Pass `awaitAnalysis: true` when connecting to a repo that may still be cloning/analyzing —
+ * this enables the backend's hold-queue and uses a 5-minute timeout to match.
+ * Normal calls (e.g. repo switching between already-indexed repos) use the default 10s timeout.
+ *
+ * Must stay in sync with HOLD_QUEUE_TIMEOUT_SECS in gitnexus/src/server/api.ts.
+ */
+const HOLD_QUEUE_TIMEOUT_MS = 300_000; // 5 minutes — matches backend HOLD_QUEUE_TIMEOUT_SECS
+
+export const fetchRepoInfo = async (
+  repo?: string,
+  opts?: { awaitAnalysis?: boolean },
+): Promise<BackendRepo> => {
   const url = `${_backendUrl}/api/repo${repo ? `?${repoParam(repo)}` : ''}`;
-  const response = await fetchWithTimeout(url);
+  const timeout = opts?.awaitAnalysis ? HOLD_QUEUE_TIMEOUT_MS : undefined;
+  const response = await fetchWithTimeout(url, {}, timeout);
   await assertOk(response);
   const data = await response.json();
   return { ...data, repoPath: data.repoPath ?? data.path };
@@ -404,12 +537,18 @@ export const fetchGraph = async (
     onProgress?: (downloaded: number, total: number | null) => void;
   },
 ): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
-  const params = [repoParam(repo), opts?.includeContent ? 'includeContent=true' : '']
+  const params = [repoParam(repo), opts?.includeContent ? 'includeContent=true' : '', 'stream=true']
     .filter(Boolean)
     .join('&');
   const url = `${_backendUrl}/api/graph${params ? `?${params}` : ''}`;
-  const response = await fetchWithTimeout(url, { signal: opts?.signal }, 60_000);
+  // Large repos can take a while to serialize the graph — use an elevated timeout
+  const response = await fetchWithTimeout(url, { signal: opts?.signal }, 120_000);
   await assertOk(response);
+
+  const contentType = response.headers.get('Content-Type') || '';
+  if (contentType.includes('application/x-ndjson')) {
+    return parseNdjsonGraphResponse(response, opts?.onProgress);
+  }
 
   if (!opts?.onProgress || !response.body) {
     return response.json() as Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }>;
@@ -437,6 +576,66 @@ export const fetchGraph = async (
     offset += chunk.length;
   }
   return JSON.parse(new TextDecoder().decode(combined));
+};
+
+const parseNdjsonGraphResponse = async (
+  response: Response,
+  onProgress?: (downloaded: number, total: number | null) => void,
+): Promise<{ nodes: GraphNode[]; relationships: GraphRelationship[] }> => {
+  if (!response.body) {
+    throw new BackendError('No response body', response.status, 'server');
+  }
+
+  const contentLength = response.headers.get('Content-Length');
+  const total = contentLength ? parseInt(contentLength, 10) : null;
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const nodes: GraphNode[] = [];
+  const relationships: GraphRelationship[] = [];
+  let buffer = '';
+  let downloaded = 0;
+
+  const parseLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed) return;
+
+    const record = JSON.parse(trimmed) as
+      | { type: 'node'; data: GraphNode }
+      | { type: 'relationship'; data: GraphRelationship }
+      | { type: 'error'; error: string };
+
+    if (record.type === 'node') {
+      nodes.push(record.data);
+      return;
+    }
+    if (record.type === 'relationship') {
+      relationships.push(record.data);
+      return;
+    }
+    if (record.type === 'error') {
+      throw new BackendError(record.error, response.status || 500, 'server');
+    }
+  };
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    downloaded += value.length;
+    onProgress?.(downloaded, total);
+    buffer += decoder.decode(value, { stream: true });
+
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      parseLine(line);
+    }
+  }
+
+  buffer += decoder.decode();
+  parseLine(buffer);
+
+  return { nodes, relationships };
 };
 
 /** Execute a Cypher query. Returns rows. */
@@ -670,18 +869,21 @@ export interface ConnectResult {
 /**
  * Connect to a server: validate, fetch repo info, download graph.
  * Content is NOT included (use readFile/grep for file access).
+ * Pass `awaitAnalysis: true` when the repo may still be cloning/analyzing —
+ * this enables the backend hold-queue and a 5-minute fetch timeout.
  */
 export async function connectToServer(
   url: string,
   onProgress?: (phase: string, downloaded: number, total: number | null) => void,
   signal?: AbortSignal,
   repoName?: string,
+  opts?: { awaitAnalysis?: boolean },
 ): Promise<ConnectResult> {
   const baseUrl = normalizeServerUrl(url);
   setBackendUrl(baseUrl);
 
   onProgress?.('validating', 0, null);
-  const repoInfo = await fetchRepoInfo(repoName);
+  const repoInfo = await fetchRepoInfo(repoName, { awaitAnalysis: opts?.awaitAnalysis });
 
   onProgress?.('downloading', 0, null);
   const { nodes, relationships } = await fetchGraph(repoName, {

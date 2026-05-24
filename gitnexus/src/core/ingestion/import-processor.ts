@@ -8,11 +8,16 @@ import { generateId } from '../../lib/utils.js';
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import { isVerboseIngestionEnabled } from './utils/verbose.js';
 import { yieldToEventLoop } from './utils/event-loop.js';
+import { parseSourceSafe } from '../tree-sitter/safe-parse.js';
 import type { ExtractedImport } from './workers/parse-worker.js';
 import { getTreeSitterBufferSize } from './constants.js';
 import { loadImportConfigs } from './language-config.js';
 import { buildSuffixIndex } from './import-resolvers/utils.js';
-import type { ResolutionContext, ModuleAliasMap } from './resolution-context.js';
+import type {
+  ResolutionContext,
+  ModuleAliasMap,
+  NamedImportMap,
+} from './model/resolution-context.js';
 import type {
   ImportResult,
   ResolveCtx,
@@ -20,9 +25,10 @@ import type {
 } from './import-resolvers/types.js';
 import type { NamedBinding } from './named-bindings/types.js';
 import type { SyntaxNode } from './utils/ast-helpers.js';
+import { isDev } from './utils/env.js';
+import { isRegistryPrimary } from './registry-primary-flag.js';
 
-const isDev = process.env.NODE_ENV === 'development';
-
+import { logger } from '../logger.js';
 // Type: Map<FilePath, Set<ResolvedFilePath>>
 // Stores all files that a given file imports from
 export type ImportMap = Map<string, Set<string>>;
@@ -60,30 +66,6 @@ function wireImplicitImports(
 // Stores Go package directory suffixes imported by a file (e.g., "/internal/auth/").
 // Avoids expanding every Go package import into N individual ImportMap edges.
 export type PackageMap = Map<string, Set<string>>;
-
-// Type: Map<ImportingFilePath, Map<LocalName, {sourcePath, exportedName}>>
-// Tracks which specific names a file imports from which sources (TS/Python only).
-// Used to tighten Tier 2a resolution: `import { User } from './models'`
-// means only `User` (not `Repo`) is visible from models.ts via this import.
-// Stores both the resolved source path and the original exported name so that
-// aliased imports (`import { User as U }`) can resolve U → User in the source file.
-export interface NamedImportBinding {
-  sourcePath: string;
-  exportedName: string;
-}
-export type NamedImportMap = Map<string, Map<string, NamedImportBinding>>;
-
-/**
- * Check if a file path is directly inside a package directory identified by its suffix.
- * Used by the symbol resolver for Go and C# directory-level import matching.
- */
-export function isFileInPackageDir(filePath: string, dirSuffix: string): boolean {
-  // Prepend '/' so paths like "internal/auth/service.go" match suffix "/internal/auth/"
-  const normalized = '/' + filePath.replace(/\\/g, '/');
-  if (!normalized.includes(dirSuffix)) return false;
-  const afterDir = normalized.substring(normalized.indexOf(dirSuffix) + dirSuffix.length);
-  return !afterDir.includes('/');
-}
 
 // ImportResolutionContext is defined in ./import-resolvers/types.ts — re-exported here for consumers.
 
@@ -126,6 +108,8 @@ function createImportEdgeHelpers(graph: KnowledgeGraph, importMap: ImportMap) {
   let totalImportsResolved = 0;
 
   const addImportGraphEdge = (filePath: string, resolvedPath: string) => {
+    const language = getLanguageFromFilename(filePath);
+    if (language !== null && isRegistryPrimary(language)) return;
     const sourceId = generateId('File', filePath);
     const targetId = generateId('File', resolvedPath);
     const relId = generateId('IMPORTS', `${filePath}->${resolvedPath}`);
@@ -322,9 +306,10 @@ export const processImports = async (
     let wasReparsed = false;
 
     if (!tree) {
+      const parseContent = provider.preprocessSource?.(file.content, file.path) ?? file.content;
       try {
-        tree = parser.parse(file.content, undefined, {
-          bufferSize: getTreeSitterBufferSize(file.content.length),
+        tree = parseSourceSafe(parser, parseContent, undefined, {
+          bufferSize: getTreeSitterBufferSize(parseContent),
         });
       } catch (parseError) {
         continue;
@@ -342,14 +327,18 @@ export const processImports = async (
       matches = query.matches(tree.rootNode);
     } catch (queryError: any) {
       if (isDev) {
-        console.group(`🔴 Query Error: ${file.path}`);
-        console.log('Language:', language);
-        console.log('Query (first 200 chars):', queryStr.substring(0, 200) + '...');
-        console.log('Error:', queryError?.message || queryError);
-        console.log('File content (first 300 chars):', file.content.substring(0, 300));
-        console.log('AST root type:', tree.rootNode?.type);
-        console.log('AST has errors:', tree.rootNode?.hasError);
-        console.groupEnd();
+        logger.error(
+          {
+            file: file.path,
+            language,
+            err: queryError?.message || queryError,
+            queryPreview: queryStr.substring(0, 200) + '...',
+            contentPreview: file.content.substring(0, 300),
+            astRootType: tree.rootNode?.type,
+            astHasError: tree.rootNode?.hasError,
+          },
+          'tree-sitter query error',
+        );
       }
 
       if (wasReparsed) (tree as unknown as { delete?: () => void }).delete?.();
@@ -364,7 +353,7 @@ export const processImports = async (
         const sourceNode = captureMap['import.source'] ?? captureMap['import'];
         if (!sourceNode) {
           if (isDev) {
-            console.log(`⚠️ Import captured but no source node in ${file.path}`);
+            logger.info(`⚠️ Import captured but no source node in ${file.path}`);
           }
           return;
         }
@@ -417,14 +406,14 @@ export const processImports = async (
 
   if (skippedByLang && skippedByLang.size > 0) {
     for (const [lang, count] of skippedByLang.entries()) {
-      console.warn(
+      logger.warn(
         `[ingestion] Skipped ${count} ${lang} file(s) in import processing — ${lang} parser not available.`,
       );
     }
   }
 
   if (isDev) {
-    console.log(
+    logger.info(
       `📊 Import processing complete: ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`,
     );
   }
@@ -516,7 +505,7 @@ export const processImportsFromExtracted = async (
   );
 
   if (isDev) {
-    console.log(
+    logger.info(
       `📊 Import processing (fast path): ${getResolvedCount()}/${totalImportsFound} imports resolved to graph edges`,
     );
   }

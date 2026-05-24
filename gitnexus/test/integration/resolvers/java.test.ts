@@ -1,11 +1,12 @@
 /**
  * Java: class extends + implements multiple interfaces + ambiguous package disambiguation
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
+  createResolverParityIt,
   getRelationships,
   getNodesByLabel,
   getNodesByLabelFull,
@@ -13,6 +14,8 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './helpers.js';
+
+const it = createResolverParityIt('java');
 
 // ---------------------------------------------------------------------------
 // Heritage: class extends + implements multiple interfaces
@@ -168,6 +171,72 @@ describe('Java call resolution with arity filtering', () => {
     expect(calls[0].target).toBe('writeAudit');
     expect(calls[0].targetFilePath).toBe('util/OneArg.java');
     expect(calls[0].rel.reason).toBe('import-resolved');
+  });
+});
+
+describe('Java same-module priority for duplicate FQNs', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-duplicate-fqn-modules'), () => {});
+  }, 60000);
+
+  it('resolves Module1App.run calls to module1 UserService, not module2', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const module1ToModule1 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        c.targetFilePath === 'module1/src/main/java/com/example/UserService.java',
+    );
+    const module1ToModule2 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        c.targetFilePath === 'module2/src/main/java/com/example/UserService.java',
+    );
+    const module1ToAnyUserService = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module1/src/main/java/com/example/Module1App.java' &&
+        /module[12]\/src\/main\/java\/com\/example\/UserService\.java/.test(c.targetFilePath),
+    );
+
+    expect(module1ToModule1.length).toBe(1);
+    expect(module1ToModule2.length).toBe(0);
+    expect(module1ToAnyUserService.length).toBe(1);
+  });
+
+  it('resolves Module2App.run calls to module2 UserService, not module1', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const module2ToModule2 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        c.targetFilePath === 'module2/src/main/java/com/example/UserService.java',
+    );
+    const module2ToModule1 = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        c.targetFilePath === 'module1/src/main/java/com/example/UserService.java',
+    );
+    const module2ToAnyUserService = calls.filter(
+      (c) =>
+        c.source === 'run' &&
+        c.target === 'UserService' &&
+        c.sourceFilePath === 'module2/src/main/java/com/example/Module2App.java' &&
+        /module[12]\/src\/main\/java\/com\/example\/UserService\.java/.test(c.targetFilePath),
+    );
+
+    expect(module2ToModule2.length).toBe(1);
+    expect(module2ToModule1.length).toBe(0);
+    expect(module2ToAnyUserService.length).toBe(1);
   });
 });
 
@@ -437,6 +506,54 @@ describe('Java variadic call resolution', () => {
       }
     }
     expect(allDangling).toEqual([]);
+  });
+
+  it('resolves 2-arg call to fixed-prefix varargs method format(int, String...) in Formatter.java', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const fmtCall = calls.find((c) => c.target === 'format' && c.source === 'run');
+    expect(fmtCall).toBeDefined();
+    expect(fmtCall!.targetFilePath).toBe('com/example/util/Formatter.java');
+  });
+
+  it('0-arg call to format(int, String...) still resolves in legacy mode (arity rejection is registry-only)', () => {
+    // In REGISTRY_PRIMARY_JAVA=1 mode, `requiredParameterCount = 1` causes
+    // `javaArityCompatibility` to return 'incompatible' for 0-arg calls,
+    // preventing the CALLS edge. In default (legacy) mode, arity is not
+    // enforced so the edge is created. This test documents the legacy
+    // behavior; the negative assertion is a flip-blocker for registry-primary.
+    const calls = getRelationships(result, 'CALLS');
+    const zeroArgFmtCall = calls.find((c) => c.target === 'format' && c.source === 'badCall');
+    expect(zeroArgFmtCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Wildcard import: `import com.example.models.*` resolves to a package file
+// ---------------------------------------------------------------------------
+
+describe('Java wildcard import resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-wildcard-import'), () => {});
+  }, 60000);
+
+  it('parses wildcard import without errors and creates graph nodes', () => {
+    // The wildcard import (`import com.example.models.*`) exercises the
+    // directoryChild branch in resolveJavaImportTarget.  Even if no IMPORTS
+    // edge is created (nondeterministic file selection — documented flip
+    // blocker), the graph must contain valid nodes for all classes.
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Main');
+    expect(classes).toContain('User');
+    expect(classes).toContain('Order');
+  });
+
+  it('resolves user.save() call via wildcard-imported User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const saveCall = calls.find((c) => c.target === 'save' && c.source === 'run');
+    expect(saveCall).toBeDefined();
+    expect(saveCall!.targetFilePath).toBe('com/example/models/User.java');
   });
 });
 
@@ -2096,5 +2213,74 @@ describe('Cross-class method chain resolution (Java) — #575', () => {
     const accesses = getRelationships(result, 'ACCESSES');
     const cityAccess = accesses.filter((e) => e.target === 'city' && e.source === 'mixedChain');
     expect(cityAccess.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SM-9: lookupMethodByOwnerWithMRO — class Child extends Parent
+// child.parentMethod() resolves to Parent#parentMethod via MRO parent walk.
+// ---------------------------------------------------------------------------
+
+describe('Java Child extends Parent — inherited method resolution (SM-9)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'java-child-extends-parent'), () => {});
+  }, 60000);
+
+  it('detects Parent and Child classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Parent');
+    expect(classes).toContain('Child');
+  });
+
+  it('emits EXTENDS edge: Child → Parent', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('Child → Parent');
+  });
+
+  it('resolves c.parentMethod() to Parent#parentMethod via MRO walk', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const parentMethodCall = calls.find(
+      (c) => c.target === 'parentMethod' && c.targetFilePath.includes('Parent'),
+    );
+    expect(parentMethodCall).toBeDefined();
+    // Pin the caller too — not just the target — so a regression that
+    // misattributes the edge to a different source would fail loudly.
+    expect(parentMethodCall!.source).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SM-11: Java User implements Validator — interface default method (Java 8+)
+// ---------------------------------------------------------------------------
+
+describe('Java User implements Validator — interface default method (SM-11)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'java-interface-default-method'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Validator interface and User class', () => {
+    expect(getNodesByLabel(result, 'Interface')).toContain('Validator');
+    expect(getNodesByLabel(result, 'Class')).toContain('User');
+  });
+
+  it('emits IMPLEMENTS edge: User → Validator', () => {
+    const impls = getRelationships(result, 'IMPLEMENTS');
+    expect(edgeSet(impls)).toContain('User → Validator');
+  });
+
+  it('resolves user.validate() to Validator.validate via implements-split MRO', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const validateCall = calls.find(
+      (c) => c.target === 'validate' && c.targetFilePath.includes('Validator.java'),
+    );
+    expect(validateCall).toBeDefined();
+    expect(validateCall!.source).toBe('run');
   });
 });

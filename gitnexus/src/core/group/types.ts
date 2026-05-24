@@ -1,5 +1,5 @@
-export type ContractType = 'http' | 'grpc' | 'topic' | 'lib' | 'custom';
-export type MatchType = 'exact' | 'manifest' | 'bm25' | 'embedding';
+export type ContractType = 'http' | 'grpc' | 'thrift' | 'topic' | 'lib' | 'custom' | 'include';
+export type MatchType = 'exact' | 'manifest' | 'wildcard' | 'bm25' | 'embedding';
 export type ContractRole = 'provider' | 'consumer';
 
 export interface GroupConfig {
@@ -24,15 +24,36 @@ export interface GroupManifestLink {
 export interface DetectConfig {
   http: boolean;
   grpc: boolean;
+  thrift: boolean;
   topics: boolean;
   shared_libs: boolean;
   embedding_fallback: boolean;
+  includes: boolean;
+  workspace_deps: boolean;
 }
 
 export interface MatchingConfig {
   bm25_threshold: number;
   embedding_threshold: number;
   max_candidates_per_step: number;
+  /**
+   * HTTP paths to exclude from cross-link matching. Contracts at these paths
+   * are still extracted and visible in the registry, but they don't produce
+   * cross-repo links. Useful for health-check endpoints (`/ping`, `/health`)
+   * that every service exposes and would otherwise create N×M false links.
+   * Trailing slashes are normalized before comparison.
+   * @default []
+   */
+  exclude_links_paths?: string[];
+  /**
+   * When `true`, exclude HTTP routes where every path segment is `{param}`
+   * (e.g. `/{param}`, `/{param}/{param}`) from cross-link matching. Mixed
+   * routes like `/users/{param}` are not affected. These param-only routes
+   * collapse to a single catch-all after normalization and produce false
+   * positives across unrelated services.
+   * @default false
+   */
+  exclude_links_param_only_paths?: boolean;
 }
 
 export interface SymbolRef {
@@ -96,6 +117,9 @@ export interface RepoHandle {
   storagePath: string;
 }
 
+/** Why local impact or fan-out stopped early (e.g. wall-clock budget exhausted). */
+export type GroupImpactTruncationReason = 'timeout' | 'partial';
+
 export interface GroupImpactResult {
   local: unknown;
   group: string;
@@ -110,6 +134,36 @@ export interface GroupImpactResult {
     cross_repo_hits: number;
   };
   risk: string;
+  /**
+   * Milliseconds budget applied to the **Phase 1 local impact** leg (`safeLocalImpact`).
+   * If the walk hits this wall first, expect `truncationReason: 'timeout'` and a partial `local` payload.
+   */
+  timeoutMs?: number;
+  /** Present when local impact or fan-out stopped early (timeout, graph cap, etc.). */
+  truncationReason?: GroupImpactTruncationReason;
+  /**
+   * Human-readable note when `crossDepth` was clamped (e.g. multi-hop not implemented yet).
+   */
+  crossDepthWarning?: string;
+}
+
+/** One repo’s `context` tool payload in a group-scoped context run. */
+export interface GroupContextRepoEntry {
+  repoPath: string;
+  registryName: string;
+  payload: unknown;
+}
+
+/**
+ * Aggregated group `context`: explicit per-repo rows (no merged symbol payloads).
+ * Use top-level `error` only for unrecoverable failures, not for “no matches” or service scope misses.
+ */
+export interface GroupContextResult {
+  group: string;
+  target?: string;
+  service?: string;
+  error?: string;
+  results: GroupContextRepoEntry[];
 }
 
 export interface CrossRepoImpact {
@@ -130,4 +184,18 @@ export interface OutOfScopeLink {
   to: string;
   contractId: string;
   confidence: number;
+}
+
+/** Opaque handle to an open bridge LadybugDB. */
+export interface BridgeHandle {
+  /** Internal — do not access directly. */
+  readonly _db: unknown;
+  readonly _conn: unknown;
+  readonly groupDir: string;
+}
+
+export interface BridgeMeta {
+  version: number;
+  generatedAt: string;
+  missingRepos: string[];
 }

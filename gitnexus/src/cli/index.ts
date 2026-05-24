@@ -7,6 +7,8 @@ import { Command } from 'commander';
 import { createRequire } from 'node:module';
 import { createLazyAction } from './lazy-action.js';
 import { registerGroupCommands } from './group.js';
+import { localizeCliHelp } from './help-i18n.js';
+import { t } from './i18n/index.js';
 
 const _require = createRequire(import.meta.url);
 const pkg = _require('../../package.json');
@@ -23,15 +25,68 @@ program
   .command('analyze [path]')
   .description('Index a repository (full analysis)')
   .option('-f, --force', 'Force full re-index even if up to date')
-  .option('--embeddings', 'Enable embedding generation for semantic search (off by default)')
-  .option('--skills', 'Generate repo-specific skill files from detected communities')
-  .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
-  .option('--skip-git', 'Index a folder without requiring a .git directory')
-  .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
-  .addHelpText(
-    'after',
-    '\nEnvironment variables:\n  GITNEXUS_NO_GITIGNORE=1  Skip .gitignore parsing (still reads .gitnexusignore)',
+  .option('--repair-fts', 'Repair/rebuild search FTS indexes without full re-analysis')
+  .option(
+    '--embeddings [limit]',
+    'Enable embedding generation for semantic search (off by default). ' +
+      'Optional [limit] overrides the 50,000-node safety cap; pass 0 to disable the cap entirely.',
   )
+  .option(
+    '--drop-embeddings',
+    'Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` ' +
+      'preserves any embeddings already present in the index.',
+  )
+  .option(
+    '--skills',
+    'Generate repo-specific skill files from detected communities ' +
+      '(no-op when --index-only is also set).',
+  )
+  .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
+  .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
+  .option(
+    '--skip-skills',
+    'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. ' +
+      'Does not suppress community skills from --skills (those use .claude/skills/generated/). ' +
+      'Use --index-only to skip all AI-context file injection.',
+  )
+  .option('--index-only', 'Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills)')
+  .option(
+    '--skip-git',
+    'Treat the provided path/cwd as the index root and skip parent git-root discovery',
+  )
+  .option(
+    '--name <alias>',
+    'Register this repo under a custom name in ~/.gitnexus/registry.json ' +
+      '(disambiguates repos whose paths share a basename, e.g. two different .../app folders)',
+  )
+  .option(
+    '--allow-duplicate-name',
+    'Register this repo even if another path already uses the same --name alias. ' +
+      'Leaves `-r <name>` ambiguous for the two paths; use -r <path> to disambiguate.',
+  )
+  .option('-v, --verbose', 'Enable verbose ingestion warnings (default: false)')
+  .option(
+    '--max-file-size <kb>',
+    'Skip files larger than this (KB). Default: 512. Hard cap: 32768 (tree-sitter limit).',
+  )
+  .option(
+    '--worker-timeout <seconds>',
+    'Worker sub-batch idle timeout before retry/fallback. Default: 30.',
+  )
+  .option(
+    '--wal-checkpoint-threshold <bytes>',
+    'LadybugDB WAL auto-checkpoint threshold in bytes during analyze ' +
+      '(integer >= -1; default: 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).',
+  )
+  .option(
+    '--workers <n>',
+    'Parse worker pool size. Default: cores-1 capped at 16. Pass 0 to disable workers (sequential).',
+  )
+  .option('--embedding-threads <n>', 'Limit local ONNX embedding CPU threads')
+  .option('--embedding-batch-size <n>', 'Number of nodes per embedding batch')
+  .option('--embedding-sub-batch-size <n>', 'Number of chunks per embedding model call')
+  .option('--embedding-device <device>', 'Embedding device: auto, cpu, dml, cuda, or wasm')
+  .addHelpText('after', () => t('help.analyze.environment'))
   .action(createLazyAction(() => import('./analyze.js'), 'analyzeCommand'));
 
 program
@@ -66,11 +121,26 @@ program
   .action(createLazyAction(() => import('./status.js'), 'statusCommand'));
 
 program
+  .command('doctor')
+  .description('Show runtime platform capabilities and embedding configuration')
+  .action(createLazyAction(() => import('./doctor.js'), 'doctorCommand'));
+
+program
   .command('clean')
   .description('Delete GitNexus index for current repo')
   .option('-f, --force', 'Skip confirmation prompt')
   .option('--all', 'Clean all indexed repos')
+  .option('--lbug-sidecars', 'Clean quarantined LadybugDB missing-shadow WAL sidecars')
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
+
+program
+  .command('remove <target>')
+  .description(
+    'Delete the GitNexus index for a registered repo (by alias, name, or absolute path). ' +
+      'Unlike `clean`, does not require being inside the repo. Idempotent on unknown targets.',
+  )
+  .option('-f, --force', 'Skip confirmation prompt')
+  .action(createLazyAction(() => import('./remove.js'), 'removeCommand'));
 
 program
   .command('wiki [path]')
@@ -93,15 +163,33 @@ program
   )
   .option('--no-reasoning-model', 'Disable reasoning model mode (overrides saved config)')
   .option('--concurrency <n>', 'Parallel LLM calls (default: 3)', '3')
+  .option('--timeout <seconds>', 'LLM request timeout in seconds (default: disabled)')
+  .option('--retries <n>', 'Max LLM retry attempts per request (default: 3)')
   .option('--gist', 'Publish wiki as a public GitHub Gist after generation')
   .option('-v, --verbose', 'Enable verbose output (show LLM commands and responses)')
   .option('--review', 'Stop after grouping to review module structure before generating pages')
+  .option(
+    '--lang <lang>',
+    'Output language for generated documentation (e.g. english, chinese, spanish, japanese)',
+  )
   .action(createLazyAction(() => import('./wiki.js'), 'wikiCommand'));
 
 program
   .command('augment <pattern>')
   .description('Augment a search pattern with knowledge graph context (used by hooks)')
   .action(createLazyAction(() => import('./augment.js'), 'augmentCommand'));
+
+program
+  .command('publish [path]')
+  .description(
+    'Notify the understand-quickly registry that this repo has a fresh GitNexus index. ' +
+      'Opt-in: requires UNDERSTAND_QUICKLY_TOKEN (fine-grained PAT with ' +
+      '`Repository dispatches: write` on looptech-ai/understand-quickly). ' +
+      'No-op without the token. See https://github.com/looptech-ai/understand-quickly.',
+  )
+  .option('--id <owner/repo>', 'Override the registry id (defaults to the origin remote)')
+  .option('--skip-git', 'Treat cwd as the repo root and skip parent git-root discovery')
+  .action(createLazyAction(() => import('./publish.js'), 'publishCommand'));
 
 // ─── Direct Tool Commands (no MCP overhead) ────────────────────────
 // These invoke LocalBackend directly for use in eval, scripts, and CI.
@@ -140,15 +228,29 @@ program
   .option('-r, --repo <name>', 'Target repository')
   .action(createLazyAction(() => import('./tool.js'), 'cypherCommand'));
 
+program
+  .command('detect-changes')
+  .alias('detect_changes')
+  .description('Map git diff hunks to indexed symbols and affected execution flows')
+  .option('-s, --scope <scope>', 'What to analyze: unstaged, staged, all, or compare', 'unstaged')
+  .option('-b, --base-ref <ref>', 'Branch/commit for compare scope (e.g. main)')
+  .option('-r, --repo <name>', 'Target repository')
+  .action(createLazyAction(() => import('./tool.js'), 'detectChangesCommand'));
+
 // ─── Eval Server (persistent daemon for SWE-bench) ─────────────────
 
 program
   .command('eval-server')
   .description('Start lightweight HTTP server for fast tool calls during evaluation')
   .option('-p, --port <port>', 'Port number', '4848')
+  .option(
+    '--host <host>',
+    'Bind address (default: 127.0.0.1, use 0.0.0.0 to expose to all interfaces)',
+  )
   .option('--idle-timeout <seconds>', 'Auto-shutdown after N seconds idle (0 = disabled)', '0')
   .action(createLazyAction(() => import('./eval-server.js'), 'evalServerCommand'));
 
 registerGroupCommands(program);
+localizeCliHelp(program);
 
 program.parse(process.argv);

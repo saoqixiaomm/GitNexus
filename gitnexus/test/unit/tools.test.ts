@@ -2,7 +2,7 @@
  * Unit Tests: MCP Tool Definitions
  *
  * Tests: GITNEXUS_TOOLS from tools.ts
- * - All 16 tools are defined (per-repo + group_*)
+ * - All 13 tools are defined (per-repo + group_list/group_sync)
  * - Each tool has valid name, description, inputSchema
  * - Required fields are correct
  * - Optional repo parameter is present on tools that need it
@@ -10,17 +10,15 @@
 import { describe, it, expect } from 'vitest';
 import { GITNEXUS_TOOLS } from '../../src/mcp/tools.js';
 
-const GROUP_TOOLS = new Set([
-  'group_list',
-  'group_sync',
-  'group_contracts',
-  'group_query',
-  'group_status',
-]);
+const GROUP_TOOLS = new Set(['group_list', 'group_sync']);
+const MUTATING_TOOLS = new Set(['rename', 'group_sync']);
+// Read-only tools that legitimately reach external systems. Add a tool name
+// here when introducing a read-only tool that needs openWorldHint: true.
+const OPEN_WORLD_READ_ONLY_TOOLS = new Set(['query']);
 
 describe('GITNEXUS_TOOLS', () => {
-  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 5 group)', () => {
-    expect(GITNEXUS_TOOLS).toHaveLength(16);
+  it('exports all tools (7 base + 3 route/tool/shape + 1 api_impact + 2 group)', () => {
+    expect(GITNEXUS_TOOLS).toHaveLength(13);
   });
 
   it('contains all expected tool names', () => {
@@ -45,10 +43,53 @@ describe('GITNEXUS_TOOLS', () => {
       expect(typeof tool.name).toBe('string');
       expect(tool.description).toBeTruthy();
       expect(typeof tool.description).toBe('string');
+      expect(tool.annotations).toBeDefined();
       expect(tool.inputSchema).toBeDefined();
       expect(tool.inputSchema.type).toBe('object');
       expect(tool.inputSchema.properties).toBeDefined();
       expect(Array.isArray(tool.inputSchema.required)).toBe(true);
+    }
+  });
+
+  it('each tool exposes all MCP safety annotations', () => {
+    for (const tool of GITNEXUS_TOOLS) {
+      expect(typeof tool.annotations.readOnlyHint).toBe('boolean');
+      expect(typeof tool.annotations.destructiveHint).toBe('boolean');
+      expect(typeof tool.annotations.idempotentHint).toBe('boolean');
+      expect(typeof tool.annotations.openWorldHint).toBe('boolean');
+    }
+  });
+
+  it('read-only tools are marked non-destructive and idempotent', () => {
+    for (const tool of GITNEXUS_TOOLS) {
+      if (MUTATING_TOOLS.has(tool.name)) continue;
+
+      expect(tool.annotations.readOnlyHint).toBe(true);
+      expect(tool.annotations.destructiveHint).toBe(false);
+      expect(tool.annotations.idempotentHint).toBe(true);
+      expect(tool.annotations.openWorldHint).toBe(OPEN_WORLD_READ_ONLY_TOOLS.has(tool.name));
+    }
+  });
+
+  it('query is marked open-world because it may use external embeddings', () => {
+    const queryTool = GITNEXUS_TOOLS.find((t) => t.name === 'query')!;
+    expect(queryTool.annotations).toEqual({
+      readOnlyHint: true,
+      destructiveHint: false,
+      idempotentHint: true,
+      openWorldHint: true,
+    });
+  });
+
+  it('rename and group_sync are marked mutating and non-idempotent', () => {
+    for (const name of ['rename', 'group_sync'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
+      expect(tool.annotations).toEqual({
+        readOnlyHint: false,
+        destructiveHint: true,
+        idempotentHint: false,
+        openWorldHint: false,
+      });
     }
   });
 
@@ -62,6 +103,9 @@ describe('GITNEXUS_TOOLS', () => {
   it('cypher tool requires "query" parameter', () => {
     const cypherTool = GITNEXUS_TOOLS.find((t) => t.name === 'cypher')!;
     expect(cypherTool.inputSchema.required).toContain('query');
+    expect(cypherTool.inputSchema.properties.params).toBeDefined();
+    expect(cypherTool.inputSchema.properties.params.type).toBe('object');
+    expect(cypherTool.inputSchema.properties.params.description).toContain('prepared statement');
   });
 
   it('context tool has no required parameters', () => {
@@ -101,23 +145,29 @@ describe('GITNEXUS_TOOLS', () => {
     }
   });
 
-  it('group_contracts has optional repo filter', () => {
-    const groupContracts = GITNEXUS_TOOLS.find((t) => t.name === 'group_contracts')!;
-    expect(groupContracts.inputSchema.properties).toHaveProperty('repo');
-    expect(groupContracts.inputSchema.required).not.toContain('repo');
-  });
-
   it('group tools without backend repo param omit repo property', () => {
-    for (const name of ['group_list', 'group_status', 'group_sync', 'group_query'] as const) {
+    for (const name of ['group_list', 'group_sync'] as const) {
       const tool = GITNEXUS_TOOLS.find((t) => t.name === name)!;
       expect(tool.inputSchema.properties).not.toHaveProperty('repo');
     }
   });
 
-  it('group_query requires name and query', () => {
-    const groupQuery = GITNEXUS_TOOLS.find((t) => t.name === 'group_query')!;
-    expect(groupQuery.inputSchema.required).toContain('name');
-    expect(groupQuery.inputSchema.required).toContain('query');
+  it('impact, query, and context expose optional service with minLength', () => {
+    for (const n of ['impact', 'query', 'context'] as const) {
+      const tool = GITNEXUS_TOOLS.find((t) => t.name === n)!;
+      const svc = tool.inputSchema.properties.service;
+      expect(svc, n).toBeDefined();
+      expect(svc!.minLength).toBe(1);
+    }
+  });
+
+  it('impact schema bounds match cross-impact validation ranges', () => {
+    const impact = GITNEXUS_TOOLS.find((t) => t.name === 'impact')!;
+    expect(impact.inputSchema.properties.maxDepth.minimum).toBe(1);
+    expect(impact.inputSchema.properties.maxDepth.maximum).toBe(32);
+    expect(impact.inputSchema.properties.minConfidence.minimum).toBe(0);
+    expect(impact.inputSchema.properties.minConfidence.maximum).toBe(1);
+    expect(impact.inputSchema.properties.timeoutMs.maximum).toBe(3600000);
   });
 
   it('detect_changes scope has correct enum values', () => {

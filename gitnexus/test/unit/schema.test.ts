@@ -13,6 +13,7 @@ import {
   CLASS_SCHEMA,
   INTERFACE_SCHEMA,
   METHOD_SCHEMA,
+  PROPERTY_SCHEMA,
   CODE_ELEMENT_SCHEMA,
   COMMUNITY_SCHEMA,
   PROCESS_SCHEMA,
@@ -53,6 +54,7 @@ describe('LadybugDB Schema', () => {
         'TypeAlias',
         'Const',
         'Static',
+        'Variable',
         'Property',
         'Record',
         'Delegate',
@@ -67,8 +69,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('has expected total count', () => {
-      // 9 core + 18 multi-language + Route + Tool = 30
-      expect(NODE_TABLES).toHaveLength(30);
+      // 9 core + 19 multi-language + Route + Tool = 31
+      expect(NODE_TABLES).toHaveLength(31);
     });
   });
 
@@ -114,6 +116,11 @@ describe('LadybugDB Schema', () => {
 
     it('Function schema has isExported', () => {
       expect(FUNCTION_SCHEMA).toContain('isExported BOOLEAN');
+    });
+
+    it('Property schema preserves declaredType', () => {
+      expect(SCHEMA_QUERIES).toContain(PROPERTY_SCHEMA);
+      expect(PROPERTY_SCHEMA).toContain('declaredType STRING');
     });
 
     it('Community schema has heuristicLabel and cohesion', () => {
@@ -201,7 +208,7 @@ describe('LadybugDB Schema', () => {
 
   describe('schema query ordering', () => {
     it('NODE_SCHEMA_QUERIES has correct count', () => {
-      expect(NODE_SCHEMA_QUERIES).toHaveLength(30);
+      expect(NODE_SCHEMA_QUERIES).toHaveLength(31);
     });
 
     it('REL_SCHEMA_QUERIES has one relation table', () => {
@@ -209,8 +216,8 @@ describe('LadybugDB Schema', () => {
     });
 
     it('SCHEMA_QUERIES includes all node + rel + embedding schemas', () => {
-      // 30 node + 1 rel + 1 embedding = 32
-      expect(SCHEMA_QUERIES).toHaveLength(32);
+      // 31 node + 1 rel + 1 embedding = 33
+      expect(SCHEMA_QUERIES).toHaveLength(33);
     });
 
     it('node schemas come before relation schemas in SCHEMA_QUERIES', () => {

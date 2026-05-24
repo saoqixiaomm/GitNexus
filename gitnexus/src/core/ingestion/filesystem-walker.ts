@@ -1,8 +1,11 @@
+import { isVerboseIngestionEnabled } from './utils/verbose.js';
+import { DEFAULT_MAX_FILE_SIZE_BYTES, getMaxFileSizeBytes } from './utils/max-file-size.js';
 import fs from 'fs/promises';
 import path from 'path';
 import { glob } from 'glob';
 import { createIgnoreFilter } from '../../config/ignore-service.js';
 
+import { logger } from '../logger.js';
 export interface FileEntry {
   path: string;
   content: string;
@@ -20,9 +23,21 @@ export interface FilePath {
 }
 
 const READ_CONCURRENCY = 32;
+const ANALYZE_PROGRESS_ACTIVE_ENV = 'GITNEXUS_ANALYZE_PROGRESS_ACTIVE';
 
-/** Skip files larger than 512KB — they're usually generated/vendored and crash tree-sitter */
-const MAX_FILE_SIZE = 512 * 1024;
+const warnLargeFileSkip = (message: string): void => {
+  if (process.env[ANALYZE_PROGRESS_ACTIVE_ENV] === '1') {
+    // analyze.ts routes console.warn through the progress bar logger while
+    // the bar is active. Emitting the operator-facing large-file notice there
+    // avoids raw pino NDJSON corrupting the one-line progress display in the
+    // heap-respawn child, whose stderr is intentionally piped for crash
+    // classification.
+    // eslint-disable-next-line no-console -- intentionally routed by analyze progress UI
+    console.warn(message);
+    return;
+  }
+  logger.warn(message);
+};
 
 /**
  * Phase 1: Scan repository — stat files to get paths + sizes, no content loaded.
@@ -33,6 +48,7 @@ export const walkRepositoryPaths = async (
   onProgress?: (current: number, total: number, filePath: string) => void,
 ): Promise<ScannedFile[]> => {
   const ignoreFilter = await createIgnoreFilter(repoPath);
+  const maxFileSizeBytes = getMaxFileSizeBytes();
 
   const filtered = await glob('**/*', {
     cwd: repoPath,
@@ -43,6 +59,7 @@ export const walkRepositoryPaths = async (
   const entries: ScannedFile[] = [];
   let processed = 0;
   let skippedLarge = 0;
+  const skippedLargePaths: string[] = [];
 
   for (let start = 0; start < filtered.length; start += READ_CONCURRENCY) {
     const batch = filtered.slice(start, start + READ_CONCURRENCY);
@@ -50,8 +67,9 @@ export const walkRepositoryPaths = async (
       batch.map(async (relativePath) => {
         const fullPath = path.join(repoPath, relativePath);
         const stat = await fs.stat(fullPath);
-        if (stat.size > MAX_FILE_SIZE) {
+        if (stat.size > maxFileSizeBytes) {
           skippedLarge++;
+          skippedLargePaths.push(relativePath.replace(/\\/g, '/'));
           return null;
         }
         return { path: relativePath.replace(/\\/g, '/'), size: stat.size };
@@ -70,9 +88,37 @@ export const walkRepositoryPaths = async (
   }
 
   if (skippedLarge > 0) {
-    console.warn(
-      `  Skipped ${skippedLarge} large files (>${MAX_FILE_SIZE / 1024}KB, likely generated/vendored)`,
+    const isDefault = maxFileSizeBytes === DEFAULT_MAX_FILE_SIZE_BYTES;
+    const isOverrideUnset = !process.env.GITNEXUS_MAX_FILE_SIZE;
+    const suffix = isDefault ? ', likely generated/vendored' : '';
+    warnLargeFileSkip(
+      `  Skipped ${skippedLarge} large files (>${maxFileSizeBytes / 1024}KB${suffix})`,
     );
+
+    // Always show at least the first few paths so users can diagnose why
+    // edges are missing from a specific file (issue #1659). The full list is
+    // gated behind GITNEXUS_VERBOSE=1 to avoid flooding output on repos with
+    // many generated/vendored blobs. Sort before slicing so the preview is
+    // stable across runs (fs.stat callbacks race within each batch).
+    skippedLargePaths.sort();
+    const SKIPPED_PREVIEW_CAP = 5;
+    const showAll = isVerboseIngestionEnabled() || skippedLargePaths.length <= SKIPPED_PREVIEW_CAP;
+    const preview = showAll ? skippedLargePaths : skippedLargePaths.slice(0, SKIPPED_PREVIEW_CAP);
+    for (const p of preview) {
+      warnLargeFileSkip(`  - ${p}`);
+    }
+    if (!showAll) {
+      const remaining = skippedLargePaths.length - SKIPPED_PREVIEW_CAP;
+      warnLargeFileSkip(`  ...and ${remaining} more (set GITNEXUS_VERBOSE=1 to list them all)`);
+    }
+    // Only hint about the env var when the user has not set it at all. An
+    // explicit GITNEXUS_MAX_FILE_SIZE=512 happens to resolve to the same
+    // bytes as the default but the operator clearly already knows the knob.
+    if (isDefault && isOverrideUnset) {
+      warnLargeFileSkip(
+        `  Set GITNEXUS_MAX_FILE_SIZE=<KB> to include files above the default cap.`,
+      );
+    }
   }
 
   return entries;

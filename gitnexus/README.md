@@ -33,7 +33,7 @@ To configure MCP for your editor, run `npx gitnexus setup` once — or set it up
 | Editor | MCP | Skills | Hooks (auto-augment) | Support |
 |--------|-----|--------|---------------------|---------|
 | **Claude Code** | Yes | Yes | Yes (PreToolUse) | **Full** |
-| **Cursor** | Yes | Yes | — | MCP + Skills |
+| **Cursor** | Yes | Yes | Yes (postToolUse, [manual install](../gitnexus-cursor-integration/README.md#hook-install)) | **Full** |
 | **Codex** | Yes | Yes | — | MCP + Skills |
 | **Windsurf** | Yes | — | — | MCP |
 | **OpenCode** | Yes | Yes | — | MCP + Skills |
@@ -151,10 +151,14 @@ Your AI agent gets these tools automatically:
 ```bash
 gitnexus setup                   # Configure MCP for your editors (one-time)
 gitnexus analyze [path]          # Index a repository (or update stale index)
-gitnexus analyze --force         # Force full re-index
+gitnexus analyze --repair-fts    # Fast path: rebuild/verify only FTS indexes on existing index data
+gitnexus analyze --force         # Full rebuild: re-parse + graph rebuild + FTS rebuild
 gitnexus analyze --embeddings    # Enable embedding generation (slower, better search)
 gitnexus analyze --skip-agents-md  # Preserve custom AGENTS.md/CLAUDE.md gitnexus section edits
 gitnexus analyze --verbose       # Log skipped files when parsers are unavailable
+gitnexus analyze --max-file-size 1024  # Skip files larger than N KB (default: 512, cap: 32768)
+gitnexus analyze --worker-timeout 60  # Increase worker idle timeout for slow parses
+gitnexus analyze --wal-checkpoint-threshold 67108864  # 64 MiB. Control LadybugDB WAL auto-checkpoint threshold (default: 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB)
 gitnexus mcp                     # Start MCP server (stdio) — serves all indexed repos
 gitnexus serve                   # Start local HTTP server (multi-repo) for web UI
 gitnexus index                   # Register an existing .gitnexus/ folder into the global registry
@@ -166,11 +170,11 @@ gitnexus wiki [path]             # Generate LLM-powered docs from knowledge grap
 gitnexus wiki --model <model>    # Wiki with custom LLM model (default: gpt-4o-mini)
 
 # Repository groups (multi-repo / monorepo service tracking)
-gitnexus group create <name>     # Create a repository group
-gitnexus group add <name> <repo> # Add a repo to a group
-gitnexus group remove <name> <repo> # Remove a repo from a group
-gitnexus group list [name]       # List groups, or show one group's config
-gitnexus group sync <name>       # Extract contracts and match across repos/services
+gitnexus group create <name>                                   # Create a repository group
+gitnexus group add <group> <groupPath> <registryName>          # Add a repo to a group. <groupPath> is a hierarchy path (e.g. hr/hiring/backend); <registryName> is the repo's name from the registry (see `gitnexus list`)
+gitnexus group remove <group> <groupPath>                      # Remove a repo from a group by its hierarchy path
+gitnexus group list [name]                                     # List groups, or show one group's config
+gitnexus group sync <name>                                     # Extract contracts and match across repos/services
 gitnexus group contracts <name>  # Inspect extracted contracts and cross-links
 gitnexus group query <name> <q>  # Search execution flows across all repos in a group
 gitnexus group status <name>     # Check staleness of repos in a group
@@ -233,6 +237,139 @@ Installed automatically by both `gitnexus analyze` (per-repo) and `gitnexus setu
 
 - Node.js >= 18
 - Git repository (uses git for commit tracking)
+
+## Release candidates
+
+Stable releases publish to the default `latest` dist-tag. When a pull request
+with non-documentation changes merges into `main`, an automated workflow also
+publishes a prerelease build under the `rc` dist-tag, so early adopters can
+try in-flight fixes without waiting for the next stable cut. (Docs-only
+merges are skipped.)
+
+```bash
+# Try the latest release candidate (pre-stable — may change at any time)
+npm install -g gitnexus@rc
+# — or —
+npx gitnexus@rc analyze
+```
+
+Release-candidate versions follow the standard semver prerelease format
+`X.Y.Z-rc.N`, where `X.Y.Z` is the next stable target (bumped from the
+current `latest` by patch by default; `minor` or `major` when kicking off a
+bigger cycle) and `N` increments per published rc. Example sequence:
+`1.6.2-rc.1`, `1.6.2-rc.2`, …, then once `1.6.2` ships stable,
+`1.6.3-rc.1`. See the [Releases page](https://github.com/abhigyanpatwari/GitNexus/releases)
+for the full list; stable `latest` is unaffected.
+
+## Troubleshooting
+
+### `Cannot destructure property 'package' of 'node.target' as it is null`
+
+This crash was caused by a dependency URL format that is incompatible with
+certain npm/arborist versions ([npm/cli#8126](https://github.com/npm/cli/issues/8126)).
+It is fixed in **gitnexus v1.6.2+**. Upgrade to the latest version:
+
+```bash
+npx gitnexus@latest analyze          # always uses the newest release
+# — or —
+npm install -g gitnexus@latest       # upgrade a global install
+```
+
+If you still hit npm install issues after upgrading, these generic workarounds
+may help:
+
+```bash
+npm install -g npm@latest            # update npm itself
+npm cache clean --force              # clear a possibly corrupt cache
+```
+
+### Installation fails with native module errors
+
+Some optional language grammars (Dart, Kotlin, Swift) require native compilation. If they fail, GitNexus still works — those languages will be skipped.
+
+If `npm install -g gitnexus` fails on native modules:
+
+```bash
+# Ensure build tools are available (Linux/macOS)
+# Ubuntu/Debian: sudo apt install python3 make g++
+# macOS: xcode-select --install
+
+# Retry installation
+npm install -g gitnexus
+```
+
+### Analyze warns about unavailable FTS or VECTOR extensions
+
+GitNexus uses optional DuckDB extensions for BM25 and vector search. The `gitnexus serve` and MCP read paths only ever try to `LOAD` the extensions — they never block on a network install. The `analyze` command, by default, attempts one bounded out-of-process `INSTALL` if `LOAD` fails and proceeds even when that install times out, so the index is always written to disk; BM25/vector search degrade gracefully until the extensions become available.
+
+Configure the behavior with two environment variables:
+
+| Variable | Values | Default | Effect |
+|----------|--------|---------|--------|
+| `GITNEXUS_LBUG_EXTENSION_INSTALL` | `auto`, `load-only`, `never` | `auto` | `auto` runs one bounded INSTALL if LOAD fails. `load-only` only uses already-installed extensions (recommended for offline / firewalled environments). `never` skips optional extensions entirely. |
+| `GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS` | positive integer | `15000` | Wall-clock budget for the out-of-process `INSTALL` child before it is killed. |
+| `GITNEXUS_WAL_CHECKPOINT_THRESHOLD` | integer `>= -1` | `67108864` (64 MiB) | LadybugDB WAL auto-checkpoint threshold during analyze (bytes). Auto-checkpoint remains enabled; `-1` keeps Ladybug's stock ~16 MiB. Larger thresholds reduce checkpoint frequency but increase the WAL size at rotation time — choose a smaller value on disk-constrained environments. |
+
+```bash
+# Offline/airgapped: never reach the network for extensions
+GITNEXUS_LBUG_EXTENSION_INSTALL=load-only npx gitnexus analyze
+
+# Slow network: give extension downloads more time
+GITNEXUS_LBUG_EXTENSION_INSTALL_TIMEOUT_MS=30000 npx gitnexus analyze
+```
+
+### Analysis runs out of memory
+
+For very large repositories:
+
+```bash
+# Increase Node.js heap size
+NODE_OPTIONS="--max-old-space-size=16384" npx gitnexus analyze
+
+# Exclude large directories
+echo "vendor/" >> .gitnexusignore
+echo "dist/" >> .gitnexusignore
+```
+
+### Large files are being skipped
+
+By default the walker skips files larger than **512 KB** (see log line `Skipped N large files (>512KB)`). Raise the threshold via either the CLI flag or the environment variable — both accept a value in **KB**:
+
+```bash
+# CLI flag (takes precedence over the env var)
+npx gitnexus analyze --max-file-size 2048     # skip only files > 2 MB
+
+# Environment variable (persists across commands)
+export GITNEXUS_MAX_FILE_SIZE=2048
+npx gitnexus analyze
+```
+
+Values above **32768 KB (32 MB)** are clamped to the tree-sitter parser ceiling; invalid values fall back to the 512 KB default with a one-time warning. When an override is active, `analyze` prints the effective threshold in its startup banner (e.g. `GITNEXUS_MAX_FILE_SIZE: effective threshold 2048KB (default 512KB)`).
+
+### Analyze reports a worker timeout
+
+Worker parse timeouts are recoverable. GitNexus retries stalled worker jobs with backoff, splits large jobs to isolate slow files, and falls back to the sequential parser when needed. If a large repository needs more time per worker job, use either:
+
+```bash
+# CLI flag, in seconds
+npx gitnexus analyze --worker-timeout 60
+
+# Environment variable, in milliseconds
+export GITNEXUS_WORKER_SUB_BATCH_TIMEOUT_MS=60000
+npx gitnexus analyze
+```
+
+For repositories with very large source files, `GITNEXUS_WORKER_SUB_BATCH_MAX_BYTES` controls the worker job byte budget. The default is **8388608 bytes (8 MB)**.
+
+### Worker pool resilience tuning
+
+Three env vars expose the pool's resilience layers (respawn budget, cumulative-timeout cap, circuit breaker). Defaults are tuned for typical repos; bump them when an analyze legitimately needs more retries, or lower them to fail-fast on a known-bad shape.
+
+| Variable                                          | Default                   | Effect                                                                                                                            |
+| ------------------------------------------------- | ------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| `GITNEXUS_WORKER_MAX_RESPAWNS_PER_SLOT`            | `3`                       | Max replacement spawns per slot before the slot is dropped from the active rotation.                                              |
+| `GITNEXUS_WORKER_MAX_CUMULATIVE_TIMEOUT_MS`        | `5 × subBatchTimeoutMs`   | Total retry wall-time budget per job before quarantining. Bounds exponentially-growing retry waits.                              |
+| `GITNEXUS_WORKER_CONSECUTIVE_FAILURE_THRESHOLD`    | `max(3, poolSize)`        | Per-slot consecutive deaths before the pool's circuit breaker trips. After tripping, dispatches require a fresh pool.            |
 
 ## Privacy
 

@@ -14,10 +14,10 @@ import fs from 'fs/promises';
 import {
   getStoragePaths,
   loadMeta,
-  addToGitignore,
+  ensureGitNexusIgnored,
   registerRepo,
 } from '../storage/repo-manager.js';
-import { getGitRoot, isGitRepo } from '../storage/git.js';
+import { getGitRoot, getRemoteUrl, isGitRepo } from '../storage/git.js';
 
 export interface IndexOptions {
   force?: boolean;
@@ -107,8 +107,15 @@ export const indexCommand = async (inputPathParts?: string[], options?: IndexOpt
   }
 
   // ── Register in global registry ───────────────────────────────────
+  // Refresh the on-disk meta with a freshly captured `remoteUrl` if
+  // it's missing, so an `index` of an older `.gitnexus/` still gets
+  // sibling-clone fingerprinting on subsequent use without forcing a
+  // full re-analyze.
+  if (!meta.remoteUrl && isGitRepo(repoPath)) {
+    meta.remoteUrl = getRemoteUrl(repoPath);
+  }
   await registerRepo(repoPath, meta);
-  await addToGitignore(repoPath);
+  await ensureGitNexusIgnored(repoPath);
 
   const projectName = path.basename(repoPath);
   const { stats } = meta;

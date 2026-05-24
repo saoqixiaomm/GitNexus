@@ -33,8 +33,12 @@ describe('Ruby require_relative, heritage & property resolution', () => {
     expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'User', 'UserService']);
   });
 
-  it('detects 3 modules', () => {
-    expect(getNodesByLabel(result, 'Module')).toEqual(['Cacheable', 'Loggable', 'Serializable']);
+  it('detects 3 modules (labeled as Trait for class-like registry lookup)', () => {
+    // Ruby `module` declarations are relabeled to `Trait` during ingestion so
+    // they participate in `lookupClassByName` and `buildHeritageMap`. This is
+    // the single source of truth for Ruby module detection in the graph.
+    expect(getNodesByLabel(result, 'Trait')).toEqual(['Cacheable', 'Loggable', 'Serializable']);
+    expect(getNodesByLabel(result, 'Module')).toEqual([]);
   });
 
   it('detects methods on classes and modules', () => {
@@ -431,9 +435,10 @@ describe('Ruby parent resolution', () => {
     result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-parent-resolution'), () => {});
   }, 60000);
 
-  it('detects BaseModel and User classes plus Serializable module', () => {
+  it('detects BaseModel and User classes plus Serializable module (Trait)', () => {
     expect(getNodesByLabel(result, 'Class')).toEqual(['BaseModel', 'User']);
-    expect(getNodesByLabel(result, 'Module')).toEqual(['Serializable']);
+    // Ruby modules are labeled Trait — see the "detects 3 modules" test above.
+    expect(getNodesByLabel(result, 'Trait')).toEqual(['Serializable']);
   });
 
   it('emits EXTENDS edge: User < BaseModel', () => {
@@ -1262,6 +1267,33 @@ describe('Ruby method enrichment (visibility, isStatic, parameters)', () => {
   });
 });
 
+describe('Ruby singleton_class handling via sequential path (skipWorkers)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-method-enrichment'), () => {}, {
+      skipWorkers: true,
+    });
+  }, 60000);
+
+  it('keeps Animal as the owner for class << self methods', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    expect(
+      hasMethod.find((e) => e.source === 'Animal' && e.target === 'from_habitat'),
+    ).toBeDefined();
+  });
+
+  it('marks from_habitat as static in the sequential path', () => {
+    const methods = getNodesByLabelFull(result, 'Method');
+    const fromHabitat = methods.find(
+      (m) => m.name === 'from_habitat' && m.properties.filePath?.includes('animal'),
+    );
+    expect(fromHabitat).toBeDefined();
+    expect(fromHabitat!.properties.isStatic).toBe(true);
+    expect(fromHabitat!.properties.parameterCount).toBe(1);
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Overload Dispatch: methods with different arity resolve via receiver type
 // ---------------------------------------------------------------------------
@@ -1328,5 +1360,32 @@ describe('Ruby overload dispatch (format vs format_with_prefix)', () => {
     // Ruby top-level def is parsed as a method node (tree-sitter `method` type)
     const methods = getNodesByLabel(result, 'Method');
     expect(methods).toContain('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SM-9/SM-10: lookupMethodByOwnerWithMRO + D0 fast path — Ruby first-wins
+// ---------------------------------------------------------------------------
+
+describe('Ruby Child extends Parent — inherited method resolution (SM-9)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'ruby-child-extends-parent'), () => {});
+  }, 60000);
+
+  it('detects Parent and Child classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Parent');
+    expect(classes).toContain('Child');
+  });
+
+  it('resolves c.parent_method to Parent#parent_method via first-wins MRO walk', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const parentMethodCall = calls.find(
+      (c) => c.target === 'parent_method' && c.targetFilePath.includes('parent.rb'),
+    );
+    expect(parentMethodCall).toBeDefined();
+    expect(parentMethodCall!.source).toBe('run');
   });
 });

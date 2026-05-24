@@ -292,6 +292,7 @@ export const streamAllCSVsToDisk = async (
     'TypeAlias',
     'Const',
     'Static',
+    'Variable',
     'Property',
     'Record',
     'Delegate',
@@ -300,11 +301,15 @@ export const streamAllCSVsToDisk = async (
     'Template',
     'Module',
   ] as const;
+  const propertyHeader = 'id,name,filePath,startLine,endLine,content,description,declaredType';
   const multiLangWriters = new Map<string, BufferedCSVWriter>();
   for (const t of MULTI_LANG_TYPES) {
     multiLangWriters.set(
       t,
-      new BufferedCSVWriter(path.join(csvDir, `${t.toLowerCase()}.csv`), multiLangHeader),
+      new BufferedCSVWriter(
+        path.join(csvDir, `${t.toLowerCase()}.csv`),
+        t === 'Property' ? propertyHeader : multiLangHeader,
+      ),
     );
   }
 
@@ -315,14 +320,18 @@ export const streamAllCSVsToDisk = async (
     CodeElement: codeElemWriter,
   };
 
-  const seenFileIds = new Set<string>();
+  // Deduplicate all node types — the pipeline can produce duplicate IDs across
+  // all symbol types (Class, Method, Function, etc.), not just File nodes.
+  // A single Set covering every label prevents PK violations on COPY.
+  const seenNodeIds = new Set<string>();
 
   // --- SINGLE PASS over all nodes ---
   for (const node of graph.iterNodes()) {
+    if (seenNodeIds.has(node.id)) continue;
+    seenNodeIds.add(node.id);
+
     switch (node.label) {
       case 'File': {
-        if (seenFileIds.has(node.id)) break;
-        seenFileIds.add(node.id);
         const content = await extractContent(node, contentCache);
         await fileWriter.addRow(
           [
@@ -473,6 +482,9 @@ export const streamAllCSVsToDisk = async (
                 escapeCSVNumber(node.properties.endLine, -1),
                 escapeCSVField(content),
                 escapeCSVField(node.properties.description || ''),
+                ...(node.label === 'Property'
+                  ? [escapeCSVField(node.properties.declaredType || '')]
+                  : []),
               ].join(','),
             );
           }

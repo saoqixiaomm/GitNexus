@@ -1,10 +1,13 @@
 /**
  * TypeScript: heritage resolution + ambiguous symbol disambiguation
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, expect, beforeAll, afterAll } from 'vitest';
 import path from 'path';
+import fs from 'node:fs';
+import os from 'node:os';
 import {
   FIXTURES,
+  createResolverParityIt,
   getRelationships,
   getNodesByLabel,
   getNodesByLabelFull,
@@ -12,6 +15,21 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './helpers.js';
+
+// Shadow vitest's `it` with the parity-gated runner so tests listed in
+// `LEGACY_RESOLVER_PARITY_EXPECTED_FAILURES.typescript` (helpers.ts) skip
+// under `REGISTRY_PRIMARY_TYPESCRIPT=0` (legacy DAG mode) and run normally
+// under the default registry-primary path. The scope-parity CI gate
+// requires this for the issue #1358 singleton describes below.
+const it = createResolverParityIt('typescript');
+
+function writeFixtureRepo(root: string, files: Record<string, string>): void {
+  for (const [relPath, content] of Object.entries(files)) {
+    const fullPath = path.join(root, relPath);
+    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+    fs.writeFileSync(fullPath, content, 'utf8');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Heritage: class extends + implements interface
@@ -142,6 +160,49 @@ describe('TypeScript call resolution with arity filtering', () => {
     expect(calls[0].target).toBe('writeAudit');
     expect(calls[0].targetFilePath).toBe('src/one.ts');
     expect(calls[0].rel.reason).toBe('import-resolved');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Generic function call resolution: await fn<T>(args) creates CALLS edges
+// ---------------------------------------------------------------------------
+
+describe('TypeScript generic awaited call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'typescript-generic-calls'), () => {});
+  }, 60000);
+
+  it('resolves authenticateUser → verifyToken via awaited generic call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const authCall = calls.find(
+      (c) => c.source === 'authenticateUser' && c.target === 'verifyToken',
+    );
+    expect(authCall).toBeDefined();
+    expect(authCall!.targetFilePath).toBe('src/token.ts');
+  });
+
+  it('resolves authenticateAdmin → verifyToken via awaited generic call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const adminCall = calls.find(
+      (c) => c.source === 'authenticateAdmin' && c.target === 'verifyToken',
+    );
+    expect(adminCall).toBeDefined();
+    expect(adminCall!.targetFilePath).toBe('src/token.ts');
+  });
+
+  it('resolves authenticateGuest → verify via awaited generic member call', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const guestCall = calls.find((c) => c.source === 'authenticateGuest' && c.target === 'verify');
+    expect(guestCall).toBeDefined();
+    expect(guestCall!.targetFilePath).toBe('src/service.ts');
+  });
+
+  it('verifyToken has exactly 2 incoming CALLS edges (both free-call callers resolved)', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const incoming = calls.filter((c) => c.target === 'verifyToken');
+    expect(incoming.length).toBe(2);
   });
 });
 
@@ -313,6 +374,45 @@ describe('TypeScript named import disambiguation', () => {
     const appImport = imports.find((e) => e.source === 'app.ts');
     expect(appImport).toBeDefined();
     expect(appImport!.targetFilePath).toBe('src/format-upper.ts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Side-effect imports: `import './polyfill'` produces an IMPORTS edge but
+// no local binding (parity with the legacy DAG, which counts side-effect
+// imports as module-reachability dependencies).
+//
+// This describe runs under both `REGISTRY_PRIMARY_TYPESCRIPT=0` (legacy
+// DAG) and `=1` (registry-primary) via the CI parity gate
+// (`.github/workflows/ci-scope-parity.yml`). Both modes must emit the
+// same IMPORTS edges; the registry-primary path emits no extra
+// `BindingRef`s for the side-effect kind.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript side-effect imports', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-side-effect-imports'),
+      () => {},
+    );
+  }, 60000);
+
+  it('emits IMPORTS edges for both side-effect imports + the named import', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter((e) => e.source === 'app.ts');
+    const targets = imports.map((e) => e.targetFilePath).sort();
+    expect(targets).toEqual(['src/greeter.ts', 'src/polyfill.ts', 'src/register.ts']);
+  });
+
+  it('does not synthesize local bindings for side-effect imports', () => {
+    // A side-effect import binds no local name; nothing in `app.ts` should
+    // try to call into `polyfill.ts` or `register.ts`. The only resolved
+    // CALL edge from `main` is to `greet` in `greeter.ts`.
+    const calls = getRelationships(result, 'CALLS').filter((c) => c.source === 'main');
+    expect(calls).toHaveLength(1);
+    expect(calls[0].target).toBe('greet');
+    expect(calls[0].targetFilePath).toBe('src/greeter.ts');
   });
 });
 
@@ -519,6 +619,16 @@ describe('TypeScript constructor-inferred type resolution', () => {
     expect(saveMethods.length).toBe(2);
   });
 
+  it('resolves explicit constructor calls for User and Repo', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userCtor = calls.find((c) => c.target === 'User' && c.targetFilePath === 'src/user.ts');
+    const repoCtor = calls.find((c) => c.target === 'Repo' && c.targetFilePath === 'src/repo.ts');
+    expect(userCtor).toBeDefined();
+    expect(repoCtor).toBeDefined();
+    expect(userCtor!.targetLabel).toBe('Class');
+    expect(repoCtor!.targetLabel).toBe('Class');
+  });
+
   it('resolves user.save() to src/user.ts via constructor-inferred type', () => {
     const calls = getRelationships(result, 'CALLS');
     const userSave = calls.find((c) => c.target === 'save' && c.targetFilePath === 'src/user.ts');
@@ -537,6 +647,14 @@ describe('TypeScript constructor-inferred type resolution', () => {
     const calls = getRelationships(result, 'CALLS');
     const saveCalls = calls.filter((c) => c.target === 'save');
     expect(saveCalls.length).toBe(2);
+  });
+
+  it('resolves constructor calls for both User and Repo', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userCtor = calls.find((c) => c.target === 'User');
+    const repoCtor = calls.find((c) => c.target === 'Repo');
+    expect(userCtor).toBeDefined();
+    expect(repoCtor).toBeDefined();
   });
 });
 
@@ -2535,5 +2653,391 @@ describe('TypeScript same-arity overload cross-file resolution', () => {
         e.targetFilePath.includes('ilookup'),
     );
     expect(edges.length).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SM-9: lookupMethodByOwnerWithMRO — child.parentMethod() via first-wins walk
+// ---------------------------------------------------------------------------
+
+describe('TypeScript Child extends Parent — inherited method resolution (SM-9)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-child-extends-parent'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects Parent and Child classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('Parent');
+    expect(classes).toContain('Child');
+  });
+
+  it('emits EXTENDS edge: Child → Parent', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('Child → Parent');
+  });
+
+  it('resolves c.parentMethod() to Parent.parentMethod via first-wins MRO walk', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const parentMethodCall = calls.find(
+      (c) => c.target === 'parentMethod' && c.targetFilePath.includes('Parent.ts'),
+    );
+    expect(parentMethodCall).toBeDefined();
+    expect(parentMethodCall!.source).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1657 finding #6: ambient base class — Step 2 MRO ancestor whose body
+// is never parsed (declare class). Probes whether the owner-keyed lookup
+// can still resolve inherited members on owners that reconcile-ownership
+// skipped because they have no parsed body.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript Derived extends declare class AmbientBase — ambient MRO ancestor', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-ambient-base-class'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects AmbientBase and Derived classes', () => {
+    const classes = getNodesByLabel(result, 'Class');
+    expect(classes).toContain('AmbientBase');
+    expect(classes).toContain('Derived');
+  });
+
+  it('emits EXTENDS edge: Derived → AmbientBase', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('Derived → AmbientBase');
+  });
+
+  it('resolves d.ambientMethod() to AmbientBase.ambientMethod via MRO walk', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ambientCall = calls.find(
+      (c) => c.target === 'ambientMethod' && c.targetFilePath.includes('ambient.ts'),
+    );
+    expect(ambientCall).toBeDefined();
+    expect(ambientCall!.source).toBe('run');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1050: tsconfig path alias resolution under registry-primary path
+// (Adversarial review Finding 1 — `@/services/user` must resolve via tsconfig
+//  paths even when imports go through ScopeResolver.resolveImportTarget.)
+// ---------------------------------------------------------------------------
+
+describe('TypeScript tsconfig path alias resolution (registry-primary)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-tsconfig-aliases'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects UserService class in src/services/user.ts', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('UserService');
+  });
+
+  it('emits IMPORTS edge from app.ts to services/user.ts via @/ alias', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter(
+      (e) => e.sourceFilePath === 'src/app.ts',
+    );
+    expect(imports.map((e) => e.targetFilePath).sort()).toEqual(['src/services/user.ts']);
+  });
+
+  it('resolves new UserService() through alias to services/user.ts', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const ctor = calls.find((c) => c.target === 'UserService' && c.targetLabel === 'Class');
+    expect(ctor).toBeDefined();
+    expect(ctor!.source).toBe('main');
+    expect(ctor!.targetFilePath).toBe('src/services/user.ts');
+  });
+
+  it('resolves svc.save() through alias to services/user.ts', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const save = calls.find((c) => c.target === 'save');
+    expect(save).toBeDefined();
+    expect(save!.source).toBe('main');
+    expect(save!.targetFilePath).toBe('src/services/user.ts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1050: TSX files parsed with the TSX tree-sitter grammar (not TS).
+// (Adversarial review Finding 2 — JSX must parse so component definitions
+//  and imports are captured.)
+// ---------------------------------------------------------------------------
+
+describe('TypeScript TSX/JSX scope extraction (registry-primary)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'typescript-tsx-jsx'), () => {});
+  }, 60000);
+
+  it('detects Button and App functions in .tsx files (JSX did not break parsing)', () => {
+    const fns = getNodesByLabel(result, 'Function');
+    expect(fns).toContain('Button');
+    expect(fns).toContain('App');
+  });
+
+  it('emits IMPORTS edge from App.tsx to Button.tsx', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter(
+      (e) => e.sourceFilePath === 'src/App.tsx',
+    );
+    expect(imports.map((e) => e.targetFilePath)).toContain('src/Button.tsx');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1050: literal `import('./feature')` resolves to a target file.
+// (Adversarial review Finding 3 — dynamic-resolved emits a real IMPORTS edge.)
+// ---------------------------------------------------------------------------
+
+describe('TypeScript literal dynamic import resolution (registry-primary)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'typescript-dynamic-import'), () => {});
+  }, 60000);
+
+  it('detects Feature class in feature.ts', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('Feature');
+  });
+
+  it('emits IMPORTS edge from app.ts to feature.ts via `await import("./feature")`', () => {
+    const imports = getRelationships(result, 'IMPORTS').filter(
+      (e) => e.sourceFilePath === 'src/app.ts',
+    );
+    // Literal dynamic-import resolution is a registry-primary feature
+    // (interpreter emits `dynamic-resolved`, finalize pre-finalizes it
+    // as a file-level terminal). The legacy DAG path
+    // (`REGISTRY_PRIMARY_TYPESCRIPT=0`) does not link literal
+    // `import('…')` calls to a target file — accept that here so the
+    // CI parity gate stays green; the registry-primary path remains the
+    // authoritative guarantee.
+    if (process.env['REGISTRY_PRIMARY_TYPESCRIPT'] !== '0') {
+      expect(imports.map((e) => e.targetFilePath)).toContain('src/feature.ts');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// PR #1050: `export * as ns from './m'` namespace barrel re-export.
+// (Adversarial review Finding 4 — barrel must expose `ns` as a binding so
+//  `import { ns } from './barrel'` resolves through to the namespace target.)
+// ---------------------------------------------------------------------------
+
+describe('TypeScript namespace re-export barrel (registry-primary)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-reexport-namespace'),
+      () => {},
+    );
+  }, 60000);
+
+  it('detects User and Repo classes in base.ts', () => {
+    expect(getNodesByLabel(result, 'Class')).toEqual(['Repo', 'User']);
+  });
+
+  // The synthetic Namespace `SymbolDefinition` lives in barrel.ts's
+  // `localDefs` so `findExportByName` can satisfy a downstream
+  // `import { Models } from './barrel'`. Unit coverage for the synthetic
+  // capture lives in `typescript-captures.test.ts`. The graph-bridge does
+  // not materialize a Namespace node for `export * as` — that's why this
+  // suite asserts on the chain edges, not on a `Namespace` graph node.
+  it('emits IMPORTS edges along the barrel chain: app.ts→barrel.ts and barrel.ts→base.ts', () => {
+    const imports = getRelationships(result, 'IMPORTS');
+    const fromApp = imports
+      .filter((e) => e.sourceFilePath === 'src/app.ts')
+      .map((e) => e.targetFilePath);
+    const fromBarrel = imports
+      .filter((e) => e.sourceFilePath === 'src/barrel.ts')
+      .map((e) => e.targetFilePath);
+    expect(fromApp).toContain('src/barrel.ts');
+    expect(fromBarrel).toContain('src/base.ts');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1066 sibling regression for TypeScript: force worker-mode extraction
+// so scope-resolution reparses on cache miss, then assert large ASCII and
+// UTF-8-heavy source files still produce trailing call edges.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript large-file cache-miss parser buffer regression', () => {
+  let repoDir: string;
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    repoDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gn-ts-large-cache-'));
+    writeFixtureRepo(repoDir, {
+      'src/models.ts': `
+export class User {
+  save(): boolean {
+    return true;
+  }
+}
+`,
+      'src/ascii-app.ts': `import { User } from './models';
+
+// ${'x'.repeat(120 * 1024)}
+export function createAsciiUser(): void {
+  const user = new User();
+  user.save();
+}
+`,
+      'src/utf8-app.ts': `import { User } from './models';
+
+// ${'漢'.repeat(120_000)}
+export function createUtf8User(): void {
+  const user = new User();
+  user.save();
+}
+`,
+    });
+    result = await runPipelineFromRepo(repoDir, () => {}, {
+      workerThresholdsForTest: { minFiles: 1, minBytes: 0 },
+    });
+  }, 120000);
+
+  afterAll(() => {
+    if (repoDir !== undefined) fs.rmSync(repoDir, { recursive: true, force: true });
+  });
+
+  it('extracts trailing functions after large ASCII and UTF-8 padding', () => {
+    expect(getNodesByLabel(result, 'Function')).toEqual(
+      expect.arrayContaining(['createAsciiUser', 'createUtf8User']),
+    );
+  });
+
+  it('resolves constructor calls from both padded files to User', () => {
+    const calls = getRelationships(result, 'CALLS');
+    for (const source of ['createAsciiUser', 'createUtf8User']) {
+      const ctor = calls.find(
+        (c) => c.source === source && c.target === 'User' && c.targetLabel === 'Class',
+      );
+      expect(ctor).toBeDefined();
+      expect(ctor!.targetFilePath).toBe('src/models.ts');
+    }
+  });
+
+  it('resolves member calls from both padded files to User.save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    for (const source of ['createAsciiUser', 'createUtf8User']) {
+      const save = calls.find((c) => c.source === source && c.target === 'save');
+      expect(save).toBeDefined();
+      expect(save!.targetFilePath).toBe('src/models.ts');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1358: class-instance singleton (`export const x = new C()`)
+// PR #1718 closed the object-literal-shorthand sub-case; this fixture covers
+// the class-instance sub-case. Resolution chain: @type-binding.constructor
+// (TS query) → propagateImportedReturnTypes (cross-file mirror) →
+// receiver-bound Case 4 (simple typeBinding) → MRO walk.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript class-instance singleton resolution (issue #1358 sub-case)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-class-instance-singleton'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('detects FooService class, getUser method, caller function, fooService Const', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('FooService');
+    expect(getNodesByLabel(result, 'Method')).toContain('getUser');
+    expect(getNodesByLabel(result, 'Function')).toContain('caller');
+    expect(getNodesByLabel(result, 'Const')).toContain('fooService');
+  });
+
+  it('emits HAS_METHOD edge from FooService to getUser', () => {
+    const hasMethod = getRelationships(result, 'HAS_METHOD');
+    const fromClass = hasMethod.filter((e) => e.source === 'FooService').map((e) => e.target);
+    expect(fromClass).toEqual(['getUser']);
+  });
+
+  it('resolves caller.fooService.getUser() to FooService.getUser via constructor-inferred typeBinding', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const projected = calls
+      .filter((e) => e.source === 'caller' && e.target === 'getUser')
+      .map((e) => ({
+        targetFilePath: e.targetFilePath,
+        reason: e.rel.reason,
+        confidence: e.rel.confidence,
+      }));
+
+    expect(projected).toEqual([
+      {
+        targetFilePath: 'src/service.ts',
+        reason: 'import-resolved',
+        confidence: 0.85,
+      },
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Issue #1358: factory-pattern singleton (`export const x = makeC()`)
+// Tests the @type-binding.alias chain-follow path through
+// propagateImportedReturnTypes (followChainPostFinalize) — fooService aliases
+// makeFooService's return type, which the constructor seeds as FooService.
+// ---------------------------------------------------------------------------
+
+describe('TypeScript factory-pattern singleton resolution (issue #1358 sub-case)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'typescript-factory-singleton'),
+      () => {},
+      { skipGraphPhases: true },
+    );
+  }, 60000);
+
+  it('detects FooService class, makeFooService function, fooService Const, caller function', () => {
+    expect(getNodesByLabel(result, 'Class')).toContain('FooService');
+    expect(getNodesByLabel(result, 'Function')).toContain('makeFooService');
+    expect(getNodesByLabel(result, 'Function')).toContain('caller');
+    expect(getNodesByLabel(result, 'Const')).toContain('fooService');
+  });
+
+  it('resolves caller.fooService.getUser() through the factory chain to FooService.getUser', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const projected = calls
+      .filter((e) => e.source === 'caller' && e.target === 'getUser')
+      .map((e) => ({
+        targetFilePath: e.targetFilePath,
+        reason: e.rel.reason,
+        confidence: e.rel.confidence,
+      }));
+
+    expect(projected).toEqual([
+      {
+        targetFilePath: 'src/service.ts',
+        reason: 'import-resolved',
+        confidence: 0.85,
+      },
+    ]);
   });
 });

@@ -1,11 +1,12 @@
 /**
  * Go: package imports + cross-package calls + ambiguous struct disambiguation
  */
-import { describe, it, expect, beforeAll } from 'vitest';
+import { describe, expect, beforeAll } from 'vitest';
 import path from 'path';
 import {
   FIXTURES,
   CROSS_FILE_FIXTURES,
+  createResolverParityIt,
   getRelationships,
   getNodesByLabel,
   getNodesByLabelFull,
@@ -13,6 +14,8 @@ import {
   runPipelineFromRepo,
   type PipelineResult,
 } from './helpers.js';
+
+const it = createResolverParityIt('go');
 
 // ---------------------------------------------------------------------------
 // Heritage: package imports + cross-package calls (exercises PackageMap)
@@ -169,6 +172,26 @@ describe('Go member-call resolution', () => {
     });
     expect(structs).toContain('User');
     expect(getNodesByLabel(result, 'Method')).toContain('Save');
+  });
+});
+
+describe('Go receiver method free-call resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(
+      path.join(FIXTURES, 'go-receiver-method-free-call'),
+      () => {},
+      { workerThresholdsForTest: { minFiles: 1, minBytes: 0 } },
+    );
+  }, 60000);
+
+  it('resolves Caller -> callee when a receiver method calls a package-level function', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const calleeCall = calls.find((c) => c.source === 'Caller' && c.target === 'callee');
+    expect(calleeCall).toBeDefined();
+    expect(calleeCall!.targetLabel).toBe('Function');
+    expect(calleeCall!.targetFilePath).toBe('util.go');
   });
 });
 
@@ -587,6 +610,30 @@ describe('Go return type inference via explicit function return type', () => {
         c.targetFilePath.includes('user.go'),
     );
     expect(saveCall).toBeDefined();
+  });
+});
+
+describe('Go same-package factory return type inference', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'go-same-package-factory'), () => {});
+  }, 60000);
+
+  it('resolves user.Save() through same-package NewUser() return type', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(
+      (c) => c.target === 'Save' && c.source === 'processUser' && c.targetFilePath === 'user.go',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does not resolve user.Save() to Repo.Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(
+      (c) => c.target === 'Save' && c.source === 'processUser' && c.targetFilePath === 'repo.go',
+    );
+    expect(repoSave).toBeUndefined();
   });
 });
 
@@ -1241,6 +1288,47 @@ describe('Go cross-file binding propagation', () => {
   });
 });
 
+describe('Go aliased package selector resolution', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'go-aliased-package-import'), () => {});
+  }, 60000);
+
+  it('resolves util.Log() through an aliased package import', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const logCall = calls.find(
+      (c) =>
+        c.target === 'Log' && c.source === 'main' && c.targetFilePath === 'internal/util/log.go',
+    );
+    expect(logCall).toBeDefined();
+  });
+});
+
+describe('Go method owner resolution across package files', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'go-split-method-owner'), () => {});
+  }, 60000);
+
+  it('resolves user.Save() to the method whose receiver type is declared in another package file', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const userSave = calls.find(
+      (c) => c.target === 'Save' && c.source === 'process' && c.targetFilePath === 'save.go',
+    );
+    expect(userSave).toBeDefined();
+  });
+
+  it('does not resolve user.Save() to Repo.Save', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const repoSave = calls.find(
+      (c) => c.target === 'Save' && c.source === 'process' && c.targetFilePath === 'repo.go',
+    );
+    expect(repoSave).toBeUndefined();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // Go cmd/ helper files should NOT get entry-point multiplier (P0-1 fix)
 // Only main.go files should get the 3.0 entry-point boost, not arbitrary
@@ -1343,5 +1431,37 @@ describe('Go method enrichment', () => {
       (c) => c.target === 'Classify' && c.sourceFilePath.includes('app.go'),
     );
     expect(classifyCall).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// SM-9/SM-10: lookupMethodByOwnerWithMRO + D0 fast path — Go struct embedding
+// ---------------------------------------------------------------------------
+
+describe('Go Child embeds Parent — inherited method resolution (SM-9)', () => {
+  let result: PipelineResult;
+
+  beforeAll(async () => {
+    result = await runPipelineFromRepo(path.join(FIXTURES, 'go-child-extends-parent'), () => {});
+  }, 60000);
+
+  it('detects Parent and Child structs', () => {
+    const structs = getNodesByLabel(result, 'Struct');
+    expect(structs).toContain('Parent');
+    expect(structs).toContain('Child');
+  });
+
+  it('emits EXTENDS edge: Child → Parent (struct embedding)', () => {
+    const extends_ = getRelationships(result, 'EXTENDS');
+    expect(edgeSet(extends_)).toContain('Child → Parent');
+  });
+
+  it('resolves c.ParentMethod() to Parent.ParentMethod via first-wins MRO walk', () => {
+    const calls = getRelationships(result, 'CALLS');
+    const parentMethodCall = calls.find(
+      (c) => c.target === 'ParentMethod' && c.targetFilePath.includes('parent.go'),
+    );
+    expect(parentMethodCall).toBeDefined();
+    expect(parentMethodCall!.source).toBe('Run');
   });
 });

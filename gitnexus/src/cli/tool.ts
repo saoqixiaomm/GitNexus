@@ -17,6 +17,8 @@
 
 import { writeSync } from 'node:fs';
 import { LocalBackend } from '../mcp/local/local-backend.js';
+import { cliErrorKey } from './cli-message.js';
+import { formatDetectChangesResult } from './detect-changes-format.js';
 
 let _backend: LocalBackend | null = null;
 
@@ -25,7 +27,7 @@ async function getBackend(): Promise<LocalBackend> {
   _backend = new LocalBackend();
   const ok = await _backend.init();
   if (!ok) {
-    console.error('GitNexus: No indexed repositories found. Run: gitnexus analyze');
+    cliErrorKey('tool.noIndexed');
     process.exit(1);
   }
   return _backend;
@@ -67,7 +69,7 @@ export async function queryCommand(
   },
 ): Promise<void> {
   if (!queryText?.trim()) {
-    console.error('Usage: gitnexus query <search_query>');
+    cliErrorKey('tool.usage.query');
     process.exit(1);
   }
 
@@ -93,7 +95,7 @@ export async function contextCommand(
   },
 ): Promise<void> {
   if (!name?.trim() && !options?.uid) {
-    console.error('Usage: gitnexus context <symbol_name> [--uid <uid>] [--file <path>]');
+    cliErrorKey('tool.usage.context');
     process.exit(1);
   }
 
@@ -118,7 +120,7 @@ export async function impactCommand(
   },
 ): Promise<void> {
   if (!target?.trim()) {
-    console.error('Usage: gitnexus impact <symbol_name> [--direction upstream|downstream]');
+    cliErrorKey('tool.usage.impact');
     process.exit(1);
   }
 
@@ -153,7 +155,7 @@ export async function cypherCommand(
   },
 ): Promise<void> {
   if (!query?.trim()) {
-    console.error('Usage: gitnexus cypher <cypher_query>');
+    cliErrorKey('tool.usage.cypher');
     process.exit(1);
   }
 
@@ -163,4 +165,18 @@ export async function cypherCommand(
     repo: options?.repo,
   });
   output(result);
+}
+
+export async function detectChangesCommand(options?: {
+  scope?: string;
+  baseRef?: string;
+  repo?: string;
+}): Promise<void> {
+  const backend = await getBackend();
+  const result = await backend.callTool('detect_changes', {
+    scope: options?.scope || 'unstaged',
+    base_ref: options?.baseRef,
+    repo: options?.repo,
+  });
+  output(formatDetectChangesResult(result));
 }
