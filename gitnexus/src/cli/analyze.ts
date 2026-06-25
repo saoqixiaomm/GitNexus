@@ -604,7 +604,12 @@ export interface AnalyzeOptions {
   dropEmbeddings?: boolean;
   skills?: boolean;
   verbose?: boolean;
-  /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
+  /**
+   * Opt into project-local AI context writes. Disabled by default so routine
+   * analyze runs do not dirty AGENTS.md, CLAUDE.md, or .claude/skills.
+   */
+  writeContextFiles?: boolean;
+  /** Skip AGENTS.md and CLAUDE.md gitnexus block updates when context writes are enabled. */
   skipAgentsMd?: boolean;
   /**
    * Build the control-flow-graph / PDG substrate (#2081 M1). Opt-in; off by
@@ -624,7 +629,7 @@ export interface AnalyzeOptions {
    * default-on case.
    */
   stats?: boolean;
-  /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
+  /** Skip installing standard GitNexus skill files when context writes are enabled. */
   skipSkills?: boolean;
   /**
    * Default branch for the generated regression-compare example (#243). From
@@ -641,7 +646,7 @@ export interface AnalyzeOptions {
    * the checked-out branch inside `runFullAnalysis` when omitted.
    */
   branch?: string;
-  /** Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills). */
+  /** Pure index mode: skip all project file injection (AGENTS.md, CLAUDE.md, skills). */
   indexOnly?: boolean;
   /** Index the folder even when no .git directory is present. */
   skipGit?: boolean;
@@ -697,12 +702,10 @@ export interface AnalyzeOptions {
 /**
  * Whether the post-index skill step should run.
  *
- * The gated block does two things in sequence: (1) generates the community
- * skill files from `--skills`, and (2) re-runs `generateAIContextFiles` so
- * AGENTS.md/CLAUDE.md can reference the freshly written skills. Both are
- * suppressed together — `--index-only` drops the entire step, not just the
- * community-skill write. Name retained for the test contract; see call site
- * in `analyzeCommand` for the AGENTS.md/CLAUDE.md re-generation it also gates.
+ * The gated block generates community skill files from `--skills`.
+ * `--index-only` drops that explicit project-file write. Updating
+ * AGENTS.md/CLAUDE.md to reference those skills is handled separately and only
+ * runs when project-local context writes are enabled.
  *
  * Kept as a pure helper so the `--index-only --skills` contract is unit-tested
  * without booting the full analyze pipeline (#742 review).
@@ -711,6 +714,19 @@ export const shouldGenerateCommunitySkillFiles = (
   options: Pick<AnalyzeOptions, 'skills' | 'indexOnly'> | undefined,
   pipelineResult: unknown,
 ): boolean => Boolean(options?.skills && pipelineResult && !options?.indexOnly);
+
+export const resolveProjectFileSkips = (
+  options:
+    | Pick<AnalyzeOptions, 'indexOnly' | 'writeContextFiles' | 'skipAgentsMd' | 'skipSkills'>
+    | undefined,
+): { skipAgentsMd: boolean; skipSkills: boolean } => {
+  const skipAll = options?.indexOnly === true;
+  const writeContextFiles = options?.writeContextFiles === true && !skipAll;
+  return {
+    skipAgentsMd: skipAll || !writeContextFiles || options?.skipAgentsMd === true,
+    skipSkills: skipAll || !writeContextFiles || options?.skipSkills === true,
+  };
+};
 
 export const analyzeCommand = async (inputPath?: string, options?: AnalyzeOptions) => {
   if (await ensureHeap()) return;
@@ -842,7 +858,7 @@ const analyzeCommandImpl = async (
     // git call. Detection is best-effort and never blocks analyze.
     const cliBranch = cliOptions?.defaultBranch;
     const configBranch = fileConfig?.defaultBranch;
-    const willGenerateContext = !options.indexOnly && !options.skipAgentsMd;
+    const willGenerateContext = !resolveProjectFileSkips(options).skipAgentsMd;
     let detectedBranch: string | null = null;
     if (
       cliBranch === undefined &&
@@ -1244,9 +1260,7 @@ const analyzeCommandImpl = async (
 
   // ── Run shared analysis orchestrator ───────────────────────────────
   try {
-    const skipAll = options.indexOnly;
-    const skipAgentsMd = skipAll || options.skipAgentsMd;
-    const skipSkills = skipAll || options.skipSkills;
+    const { skipAgentsMd, skipSkills } = resolveProjectFileSkips(options);
     const result = await runFullAnalysis(
       repoPath,
       {
@@ -1260,6 +1274,7 @@ const analyzeCommandImpl = async (
         dropEmbeddings: options.dropEmbeddings,
         verbose: options.verbose,
         skipGit: options.skipGit,
+        writeContextFiles: options.writeContextFiles === true && !options.indexOnly,
         skipAgentsMd,
         skipSkills,
         // CFG/PDG substrate opt-in (#2081 M1) — threaded to both sinks downstream.
@@ -1322,7 +1337,7 @@ const analyzeCommandImpl = async (
       // analyze must not churn the committed AGENTS.md — this mirrors the
       // in-pipeline `if (!placement.branch)` gate around generateAIContextFiles.
       let baseRefRefreshed: string[] = [];
-      if (result.isPrimaryBranch !== false) {
+      if (result.isPrimaryBranch !== false && !skipAgentsMd) {
         try {
           const { refreshBaseRefLine } = await import('./ai-context.js');
           baseRefRefreshed = (
@@ -1380,7 +1395,7 @@ const analyzeCommandImpl = async (
       updateBar(99, 'Generating skill files...');
       try {
         const { generateSkillFiles } = await import('./skill-gen.js');
-        const { generateAIContextFiles } = await import('./ai-context.js');
+        const shouldRefreshAIContext = !skipAgentsMd || !skipSkills;
         const skillResult = await generateSkillFiles(
           repoPath,
           result.repoName,
@@ -1388,47 +1403,50 @@ const analyzeCommandImpl = async (
         );
         if (skillResult.skills.length > 0) {
           barLog(`  Generated ${skillResult.skills.length} skill files`);
-          // Re-generate AI context files now that we have skill info
-          const s = result.stats;
-          const communityResult = result.pipelineResult?.communityResult;
-          let aggregatedClusterCount = 0;
-          if (communityResult?.communities) {
-            const groups = new Map<string, number>();
-            for (const c of communityResult.communities) {
-              const label = c.heuristicLabel || c.label || 'Unknown';
-              groups.set(label, (groups.get(label) || 0) + c.symbolCount);
+          if (shouldRefreshAIContext) {
+            const { generateAIContextFiles } = await import('./ai-context.js');
+            // Re-generate AI context files now that we have skill info.
+            const s = result.stats;
+            const communityResult = result.pipelineResult?.communityResult;
+            let aggregatedClusterCount = 0;
+            if (communityResult?.communities) {
+              const groups = new Map<string, number>();
+              for (const c of communityResult.communities) {
+                const label = c.heuristicLabel || c.label || 'Unknown';
+                groups.set(label, (groups.get(label) || 0) + c.symbolCount);
+              }
+              aggregatedClusterCount = Array.from(groups.values()).filter(
+                (count: number) => count >= 5,
+              ).length;
             }
-            aggregatedClusterCount = Array.from(groups.values()).filter(
-              (count: number) => count >= 5,
-            ).length;
+            const { storagePath: sp } = getStoragePaths(repoPath);
+            await generateAIContextFiles(
+              repoPath,
+              sp,
+              result.repoName,
+              {
+                files: s.files ?? 0,
+                nodes: s.nodes ?? 0,
+                edges: s.edges ?? 0,
+                communities: s.communities,
+                clusters: aggregatedClusterCount,
+                processes: s.processes,
+              },
+              skillResult.skills,
+              {
+                skipAgentsMd,
+                skipSkills,
+                // Same resolved branch as the main run (#243) so the --skills
+                // re-generation of AGENTS.md/CLAUDE.md does not revert base_ref
+                // to "main".
+                defaultBranch: resolvedDefaultBranch,
+                // Mirror runFullAnalysis `noStats` bridge (#1477) — same expression;
+                // exercised on the `--skills` path by analyze-no-stats-bridge.test.ts.
+                noStats: options.stats === false,
+                hasPdg: options.pdg === true,
+              },
+            );
           }
-          const { storagePath: sp } = getStoragePaths(repoPath);
-          await generateAIContextFiles(
-            repoPath,
-            sp,
-            result.repoName,
-            {
-              files: s.files ?? 0,
-              nodes: s.nodes ?? 0,
-              edges: s.edges ?? 0,
-              communities: s.communities,
-              clusters: aggregatedClusterCount,
-              processes: s.processes,
-            },
-            skillResult.skills,
-            {
-              skipAgentsMd,
-              skipSkills,
-              // Same resolved branch as the main run (#243) so the --skills
-              // re-generation of AGENTS.md/CLAUDE.md does not revert base_ref
-              // to "main".
-              defaultBranch: resolvedDefaultBranch,
-              // Mirror runFullAnalysis `noStats` bridge (#1477) — same expression;
-              // exercised on the `--skills` path by analyze-no-stats-bridge.test.ts.
-              noStats: options.stats === false,
-              hasPdg: options.pdg === true,
-            },
-          );
         }
       } catch {
         /* best-effort */

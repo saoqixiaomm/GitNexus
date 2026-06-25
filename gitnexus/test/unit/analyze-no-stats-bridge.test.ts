@@ -159,14 +159,14 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     try {
       const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
-      await analyzeCommand(undefined, { skills: true, stats: false });
+      await analyzeCommand(undefined, { skills: true, stats: false, writeContextFiles: true });
 
       expect(generateSkillFilesMock).toHaveBeenCalledTimes(1);
       expect(generateAIContextFilesMock).toHaveBeenCalledTimes(1);
       const aiCtxOpts = generateAIContextFilesMock.mock.calls[0]![5];
       expect(aiCtxOpts).toEqual({
-        skipAgentsMd: undefined,
-        skipSkills: undefined,
+        skipAgentsMd: false,
+        skipSkills: false,
         // #243: resolved default branch threaded into the --skills regen path.
         defaultBranch: 'main',
         noStats: true,

@@ -135,11 +135,16 @@ export interface AnalyzeOptions {
    */
   dropEmbeddings?: boolean;
   skipGit?: boolean;
-  /** Skip AGENTS.md and CLAUDE.md gitnexus block updates. */
+  /**
+   * Opt into project-local AI context writes. Disabled by default so programmatic
+   * analyze callers do not dirty AGENTS.md, CLAUDE.md, or .claude/skills.
+   */
+  writeContextFiles?: boolean;
+  /** Skip AGENTS.md and CLAUDE.md gitnexus block updates when context writes are enabled. */
   skipAgentsMd?: boolean;
   /** Omit volatile symbol/relationship counts from AGENTS.md and CLAUDE.md. */
   noStats?: boolean;
-  /** Skip installing standard GitNexus skill files to .claude/skills/gitnexus/. */
+  /** Skip installing standard GitNexus skill files when context writes are enabled. */
   skipSkills?: boolean;
   /**
    * Build the CFG/PDG substrate (#2081 M1). Forwarded to `PipelineOptions.pdg`,
@@ -598,6 +603,10 @@ export async function runFullAnalysis(
   const branchLabel = options.branch ?? checkedOutBranch;
   const placement = await resolveBranchPlacement(repoPath, branchLabel);
   const { lbugPath, metaPath } = getStoragePaths(repoPath, placement.branch);
+  const writeContextFiles = options.writeContextFiles === true;
+  const skipAgentsMd = !writeContextFiles || options.skipAgentsMd === true;
+  const skipSkills = !writeContextFiles || options.skipSkills === true;
+  const shouldWriteAIContext = !placement.branch && (!skipAgentsMd || !skipSkills);
   // Directory that owns this run's meta.json (flat `.gitnexus` for the primary
   // slot, `branches/<slug>/` otherwise). loadMeta/saveMeta operate on it so
   // each branch keeps its own lastCommit / fileHashes / incremental dirty flag.
@@ -795,14 +804,35 @@ export async function runFullAnalysis(
         options.allowDuplicateName === true && !(await isRepoRegistered(repoPath));
       if (!dirty && !healUnregistered) {
         await ensureGitNexusIgnored(repoPath);
+        const repoName =
+          options.registryName ??
+          getInferredRepoName(repoPath) ??
+          path.basename(resolveRepoIdentityRoot(repoPath));
+        if (shouldWriteAIContext) {
+          try {
+            await generateAIContextFiles(
+              repoPath,
+              storagePath,
+              repoName,
+              existingMeta.stats ?? {},
+              undefined,
+              {
+                skipAgentsMd,
+                skipSkills,
+                noStats: options.noStats,
+                defaultBranch: options.defaultBranch,
+                hasPdg: options.pdg === true,
+              },
+            );
+          } catch {
+            // Best-effort — don't fail an up-to-date analysis for context file issues.
+          }
+        }
         return {
           // `resolveRepoIdentityRoot` collapses worktree roots to the
           // canonical repo basename (#1259) but leaves arbitrary subdirs
           // and `--skip-git` paths unchanged (#1232/#1233 intent preserved).
-          repoName:
-            options.registryName ??
-            getInferredRepoName(repoPath) ??
-            path.basename(resolveRepoIdentityRoot(repoPath)),
+          repoName,
           repoPath,
           stats: existingMeta.stats ?? {},
           alreadyUpToDate: true,
@@ -1539,10 +1569,9 @@ export async function runFullAnalysis(
       aggregatedClusterCount = Array.from(groups.values()).filter((count) => count >= 5).length;
     }
 
-    // Only (re)generate the repo-root AI context files (AGENTS.md / CLAUDE.md /
-    // skills) for the primary/flat index (#2106). A non-primary branch analyze
-    // must not churn the repo's committed AGENTS.md with branch-specific stats.
-    if (!placement.branch) {
+    // Only (re)generate repo-root AI context files for the primary/flat index
+    // (#2106) and only after the caller explicitly opts into project file writes.
+    if (shouldWriteAIContext) {
       try {
         await generateAIContextFiles(
           repoPath,
@@ -1558,8 +1587,8 @@ export async function runFullAnalysis(
           },
           undefined,
           {
-            skipAgentsMd: options.skipAgentsMd,
-            skipSkills: options.skipSkills,
+            skipAgentsMd,
+            skipSkills,
             noStats: options.noStats,
             defaultBranch: options.defaultBranch,
             hasPdg: options.pdg === true,

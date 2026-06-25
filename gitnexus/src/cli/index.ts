@@ -67,10 +67,18 @@ program
   )
   .option(
     '--skills',
-    'Generate repo-specific skill files from detected communities ' +
-      '(no-op when --index-only is also set).',
+    'Generate repo-specific community skill files under .claude/skills/generated/ ' +
+      '(explicit project-file write; no-op when --index-only is also set).',
   )
-  .option('--skip-agents-md', 'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md')
+  .option(
+    '--write-context-files',
+    'Write project-local AI context files (AGENTS.md, CLAUDE.md, and standard .claude/skills/gitnexus/). ' +
+      'Disabled by default.',
+  )
+  .option(
+    '--skip-agents-md',
+    'When --write-context-files is set, skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
+  )
   .option(
     '--pdg',
     'Build the control-flow-graph / PDG substrate (BasicBlock nodes + CFG edges) ' +
@@ -90,11 +98,13 @@ program
   .option('--no-stats', 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md')
   .option(
     '--skip-skills',
-    'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. ' +
-      'Does not suppress community skills from --skills (those use .claude/skills/generated/). ' +
-      'Use --index-only to skip all AI-context file injection.',
+    'When --write-context-files is set, skip installing standard GitNexus skill files under .claude/skills/gitnexus/. ' +
+      'Does not suppress community skills from --skills (those use .claude/skills/generated/).',
   )
-  .option('--index-only', 'Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills)')
+  .option(
+    '--index-only',
+    'Force pure index mode: skip all project file injection (AGENTS.md, CLAUDE.md, skills)',
+  )
   .option(
     '--skip-git',
     'Treat the provided path/cwd as the index root and skip parent git-root discovery',

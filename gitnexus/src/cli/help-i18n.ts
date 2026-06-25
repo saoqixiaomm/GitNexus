@@ -53,6 +53,7 @@ const OPTION_DESCRIPTION_KEYS = {
   'analyze|--embeddings [limit]': 'help.option.analyze.embeddings',
   'analyze|--drop-embeddings': 'help.option.analyze.dropEmbeddings',
   'analyze|--skills': 'help.option.analyze.skills',
+  'analyze|--write-context-files': 'help.option.analyze.writeContextFiles',
   'analyze|--skip-agents-md': 'help.option.analyze.skipAgentsMd',
   'analyze|--no-stats': 'help.option.analyze.noStats',
   'analyze|--skip-skills': 'help.option.analyze.skipSkills',

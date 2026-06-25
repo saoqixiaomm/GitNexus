@@ -173,14 +173,16 @@ export const en = {
   'help.option.analyze.dropEmbeddings':
     'Drop existing embeddings on rebuild. By default, an `analyze` without `--embeddings` preserves any embeddings already present in the index.',
   'help.option.analyze.skills':
-    'Generate repo-specific skill files from detected communities (no-op when --index-only is also set).',
+    'Generate repo-specific community skill files under .claude/skills/generated/ (explicit project-file write; no-op when --index-only is also set).',
+  'help.option.analyze.writeContextFiles':
+    'Write project-local AI context files (AGENTS.md, CLAUDE.md, and standard .claude/skills/gitnexus/). Disabled by default.',
   'help.option.analyze.skipAgentsMd':
-    'Skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
+    'When --write-context-files is set, skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
   'help.option.analyze.noStats': 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md',
   'help.option.analyze.skipSkills':
-    'Skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/). Use --index-only to skip all AI-context file injection.',
+    'When --write-context-files is set, skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/).',
   'help.option.analyze.indexOnly':
-    'Pure index mode: skip all file injection (AGENTS.md, CLAUDE.md, skills)',
+    'Force pure index mode: skip all project file injection (AGENTS.md, CLAUDE.md, skills)',
   'help.option.skipGit':
     'Treat the provided path/cwd as the index root and skip parent git-root discovery',
   'help.option.analyze.name':

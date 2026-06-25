@@ -1,8 +1,8 @@
 /**
  * E2E Integration Tests: --skills Flag
  *
- * Tests `gitnexus analyze --skills` across 11 supported languages plus
- * mixed-language and idempotency scenarios. Each language fixture creates
+ * Tests `gitnexus analyze --skills --write-context-files` across 11 supported
+ * languages plus mixed-language and idempotency scenarios. Each language fixture creates
  * a self-contained git repo with 2 clusters of files containing cross-file
  * function calls, then runs the full CLI pipeline and verifies SKILL.md
  * generation and context file updates.
@@ -33,20 +33,24 @@ const tsxImportUrl = pathToFileURL(path.join(tsxPkgDir, 'dist', 'loader.mjs')).h
 // ============================================================================
 
 /**
- * Spawn the CLI with `analyze --skills` in the given cwd.
+ * Spawn the CLI with `analyze --skills --write-context-files` in the given cwd.
  * Uses the absolute tsx loader URL so it works outside the project tree.
  */
 function runSkillsCli(cwd: string, timeoutMs = 45000) {
-  return spawnSync(process.execPath, ['--import', tsxImportUrl, cliEntry, 'analyze', '--skills'], {
-    cwd,
-    encoding: 'utf8',
-    timeout: timeoutMs,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: {
-      ...process.env,
-      NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --max-old-space-size=8192`.trim(),
+  return spawnSync(
+    process.execPath,
+    ['--import', tsxImportUrl, cliEntry, 'analyze', '--skills', '--write-context-files'],
+    {
+      cwd,
+      encoding: 'utf8',
+      timeout: timeoutMs,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: {
+        ...process.env,
+        NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} --max-old-space-size=8192`.trim(),
+      },
     },
-  });
+  );
 }
 
 /**
@@ -101,7 +105,7 @@ function assertSkillFiles(
   expect(
     result.status,
     [
-      `analyze --skills exited with code ${result.status}`,
+      `analyze --skills --write-context-files exited with code ${result.status}`,
       `stdout: ${result.stdout?.slice(0, 500)}`,
       `stderr: ${result.stderr?.slice(0, 500)}`,
     ].join('\n'),
@@ -2378,18 +2382,18 @@ export function createEntry(level: string, msg: string) {
   });
 
   /**
-   * Running analyze --skills twice should produce stable output:
+   * Running analyze --skills --write-context-files twice should produce stable output:
    * same number of skill directories, all SKILL.md files valid,
    * and CLAUDE.md still references generated skills.
    */
-  it('second analyze --skills produces stable output', () => {
+  it('second analyze --skills --write-context-files produces stable output', () => {
     /* CI timeout tolerance */
     if (result1.status === null || result2.status === null) return;
 
     expect(
       result1.status,
       [
-        `first analyze --skills exited with code ${result1.status}`,
+        `first analyze --skills --write-context-files exited with code ${result1.status}`,
         `stdout: ${result1.stdout?.slice(0, 500)}`,
         `stderr: ${result1.stderr?.slice(0, 500)}`,
       ].join('\n'),
@@ -2397,7 +2401,7 @@ export function createEntry(level: string, msg: string) {
     expect(
       result2.status,
       [
-        `second analyze --skills exited with code ${result2.status}`,
+        `second analyze --skills --write-context-files exited with code ${result2.status}`,
         `stdout: ${result2.stdout?.slice(0, 500)}`,
         `stderr: ${result2.stderr?.slice(0, 500)}`,
       ].join('\n'),

@@ -105,8 +105,7 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
   const writeRc = (obj: unknown) =>
     fs.writeFile(path.join(dir, '.gitnexusrc'), JSON.stringify(obj));
 
-  it('maps .gitnexusrc skipContextFiles to skipAgentsMd without implying skipSkills', async () => {
-    await writeRc({ skipContextFiles: true });
+  it('defaults to skipping project-local AI context files', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
     await analyzeCommand(dir, {});
@@ -114,11 +113,35 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     expect(runFullAnalysisMock).toHaveBeenCalledTimes(1);
     const opts = runFullAnalysisMock.mock.calls[0][1];
     expect(opts.skipAgentsMd).toBe(true);
-    expect(opts.skipSkills).toBeFalsy();
+    expect(opts.skipSkills).toBe(true);
+    expect(opts.writeContextFiles).toBe(false);
+  });
+
+  it('maps .gitnexusrc writeContextFiles to enabling project-local context writes', async () => {
+    await writeRc({ writeContextFiles: true });
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(dir, {});
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.writeContextFiles).toBe(true);
+    expect(opts.skipAgentsMd).toBe(false);
+    expect(opts.skipSkills).toBe(false);
+  });
+
+  it('maps .gitnexusrc skipContextFiles to skipAgentsMd without implying skipSkills when writes are enabled', async () => {
+    await writeRc({ writeContextFiles: true, skipContextFiles: true });
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(dir, {});
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.skipAgentsMd).toBe(true);
+    expect(opts.skipSkills).toBe(false);
   });
 
   it('indexOnly from config remains stronger than context/skills options', async () => {
-    await writeRc({ indexOnly: true });
+    await writeRc({ indexOnly: true, writeContextFiles: true, skipSkills: false });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
     await analyzeCommand(dir, {});
@@ -128,7 +151,7 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     expect(opts.skipSkills).toBe(true);
   });
 
-  it('uses .gitnexusrc defaultBranch for generated context', async () => {
+  it('threads .gitnexusrc defaultBranch into analyze options', async () => {
     await writeRc({ defaultBranch: 'develop' });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
@@ -155,7 +178,7 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     getDefaultBranchMock.mockReturnValue('trunk');
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
-    await analyzeCommand(dir, {});
+    await analyzeCommand(dir, { writeContextFiles: true });
 
     const opts = runFullAnalysisMock.mock.calls[0][1];
     expect(getDefaultBranchMock).toHaveBeenCalledTimes(1);
@@ -190,7 +213,7 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     try {
       const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
-      await analyzeCommand(dir, { skills: true });
+      await analyzeCommand(dir, { skills: true, writeContextFiles: true });
 
       expect(generateSkillFilesMock).toHaveBeenCalledTimes(1);
       expect(generateAIContextFilesMock).toHaveBeenCalledTimes(1);
@@ -217,7 +240,7 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
   });
 
   it('does not auto-detect the branch when config skips context generation (#1996)', async () => {
-    await writeRc({ skipAgentsMd: true });
+    await writeRc({ writeContextFiles: true, skipAgentsMd: true });
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 
     await analyzeCommand(dir, {});
@@ -227,8 +250,18 @@ describe('analyzeCommand .gitnexusrc wiring (#243)', () => {
     expect(runFullAnalysisMock.mock.calls[0][1].skipAgentsMd).toBe(true);
   });
 
-  it('refreshes base_ref in place on the alreadyUpToDate fast path (#1996 P2)', async () => {
+  it('does not refresh base_ref by default on the alreadyUpToDate fast path', async () => {
     await writeRc({ defaultBranch: 'develop' });
+    // Default mock returns alreadyUpToDate:true.
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(dir, {});
+
+    expect(refreshBaseRefLineMock).not.toHaveBeenCalled();
+  });
+
+  it('refreshes base_ref in place on the alreadyUpToDate fast path when context writes are enabled (#1996 P2)', async () => {
+    await writeRc({ defaultBranch: 'develop', writeContextFiles: true });
     // Default mock returns alreadyUpToDate:true.
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

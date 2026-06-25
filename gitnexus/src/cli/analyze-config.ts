@@ -20,7 +20,7 @@
  *
  * Both a flat shape and a nested `analyze` block are accepted:
  *
- *     { "defaultBranch": "develop", "skipContextFiles": true }
+ *     { "defaultBranch": "develop", "writeContextFiles": true }
  *     { "analyze": { "defaultBranch": "develop", "skipSkills": true } }
  *
  * When both set the same option, the nested `analyze` block wins (deterministic,
@@ -72,15 +72,19 @@ interface KeySpec {
  *
  * Aliases intentionally collapse onto a shared target:
  *   - `branch` is the legacy alias for `defaultBranch` (issue-comment shape).
+ *   - `writeContextFiles` is the explicit opt-in for project-local AI context
+ *     injection. Without it, analyze updates the index only and does not write
+ *     AGENTS.md, CLAUDE.md, or .claude/skills.
  *   - `skipContextFiles` / `skipAiContext` are aliases for `skipAgentsMd` — they
- *     suppress the AGENTS.md / CLAUDE.md block ONLY. They do not imply
- *     `skipSkills`, and they are weaker than `indexOnly` (which skips all
- *     file injection). This matches the existing CLI semantics exactly.
+ *     suppress the AGENTS.md / CLAUDE.md block when context writes are enabled.
+ *     They do not imply `skipSkills`, and they are weaker than `indexOnly`
+ *     (which skips all file injection).
  *   - `noStats` is the negation of `stats`.
  */
 const KEY_SPECS: Record<string, KeySpec> = {
   defaultBranch: { target: 'defaultBranch', kind: 'branch' },
   branch: { target: 'defaultBranch', kind: 'branch' },
+  writeContextFiles: { target: 'writeContextFiles', kind: 'boolean' },
   skipAgentsMd: { target: 'skipAgentsMd', kind: 'boolean' },
   skipContextFiles: { target: 'skipAgentsMd', kind: 'boolean' },
   skipAiContext: { target: 'skipAgentsMd', kind: 'boolean' },
@@ -391,7 +395,7 @@ export function loadAnalyzeConfig(repoRoot: string): Partial<AnalyzeOptions> | u
   } catch (err) {
     throw new GitNexusRcError(
       `${GITNEXUS_RC_FILENAME} is not valid JSON: ${(err as Error).message}. ` +
-        `Expected a JSON object such as {"defaultBranch": "develop", "skipContextFiles": true}.`,
+        `Expected a JSON object such as {"defaultBranch": "develop", "writeContextFiles": true}.`,
     );
   }
 

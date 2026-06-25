@@ -164,12 +164,16 @@ export const zhCN = {
   'help.option.analyze.dropEmbeddings':
     '重建时删除现有嵌入。默认情况下，未传 `--embeddings` 的 `analyze` 会保留索引中已有嵌入。',
   'help.option.analyze.skills':
-    '根据检测到的社区生成仓库专属 skill 文件（同时设置 --index-only 时无效）。',
-  'help.option.analyze.skipAgentsMd': '跳过更新 AGENTS.md 和 CLAUDE.md 中的 gitnexus 区块',
+    '根据检测到的社区在 .claude/skills/generated/ 下生成仓库专属 skill 文件（这是显式项目文件写入；同时设置 --index-only 时无效）。',
+  'help.option.analyze.writeContextFiles':
+    '写入项目本地 AI 上下文文件（AGENTS.md、CLAUDE.md 和标准 .claude/skills/gitnexus/）。默认关闭。',
+  'help.option.analyze.skipAgentsMd':
+    '设置 --write-context-files 时，跳过更新 AGENTS.md 和 CLAUDE.md 中的 gitnexus 区块',
   'help.option.analyze.noStats': '从 AGENTS.md 和 CLAUDE.md 中省略易变的文件/符号计数',
   'help.option.analyze.skipSkills':
-    '跳过安装 .claude/skills/gitnexus/ 下的标准 GitNexus skill 文件。不抑制 --skills 生成的社区 skill（位于 .claude/skills/generated/）。使用 --index-only 可跳过所有 AI 上下文文件注入。',
-  'help.option.analyze.indexOnly': '纯索引模式：跳过所有文件注入（AGENTS.md、CLAUDE.md、skills）',
+    '设置 --write-context-files 时，跳过安装 .claude/skills/gitnexus/ 下的标准 GitNexus skill 文件。不抑制 --skills 生成的社区 skill（位于 .claude/skills/generated/）。',
+  'help.option.analyze.indexOnly':
+    '强制纯索引模式：跳过所有项目文件注入（AGENTS.md、CLAUDE.md、skills）',
   'help.option.skipGit': '将提供的路径/cwd 视为索引根目录，并跳过向上查找 git 根目录',
   'help.option.analyze.name':
     '在 ~/.gitnexus/registry.json 中使用自定义名称注册该仓库（用于区分路径 basename 相同的仓库，例如两个不同的 .../app 目录）',

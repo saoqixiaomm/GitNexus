@@ -73,6 +73,7 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
     await writeRc(
       JSON.stringify({
         defaultBranch: 'develop',
+        writeContextFiles: true,
         skipContextFiles: true,
         skipSkills: true,
         embeddings: true,
@@ -82,6 +83,7 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
     const cfg = loadAnalyzeConfig(dir);
     expect(cfg).toEqual({
       defaultBranch: 'develop',
+      writeContextFiles: true,
       skipAgentsMd: true, // skipContextFiles → skipAgentsMd
       skipSkills: true,
       embeddings: true,
@@ -250,7 +252,11 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
   });
 
   it('mergeAnalyzeOptions: config fills options the CLI left unset', () => {
-    const merged = mergeAnalyzeOptions({}, { skipAgentsMd: true, workerTimeout: '60' });
+    const merged = mergeAnalyzeOptions(
+      {},
+      { writeContextFiles: true, skipAgentsMd: true, workerTimeout: '60' },
+    );
+    expect(merged.writeContextFiles).toBe(true);
     expect(merged.skipAgentsMd).toBe(true);
     expect(merged.workerTimeout).toBe('60');
   });
