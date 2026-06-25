@@ -27,12 +27,13 @@
  * declaration transparently.
  */
 
-import type { ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
+import type { Callsite, ParsedFile, ScopeId, SymbolDefinition } from 'gitnexus-shared';
 import type { ScopeResolutionIndexes } from '../../model/scope-resolution-indexes.js';
 import {
   isOverloadAmbiguousAfterNormalization,
   narrowOverloadCandidates,
 } from '../../scope-resolution/passes/overload-narrowing.js';
+import { CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES, cppConversionRank } from './conversion-rank.js';
 
 interface RangeKey {
   readonly startLine: number;
@@ -58,6 +59,30 @@ export function markCppInlineNamespaceRange(filePath: string, range: RangeKey): 
     inlineNamespaceRangesByFile.set(filePath, set);
   }
   set.add(rangeKey(range));
+}
+
+/** Snapshot this file's captured inline-namespace ranges for the worker→main
+ *  side-channel (#1983). `populateCppInlineNamespaceScopes` (in `populateOwners`)
+ *  later resolves these range keys to ScopeIds on the main thread, so only the
+ *  capture-time ranges need to cross the boundary. Returns the rangeKey strings
+ *  as a plain array (empty when this file recorded none). */
+export function collectCppInlineNamespaceSideChannel(filePath: string): readonly string[] {
+  const set = inlineNamespaceRangesByFile.get(filePath);
+  return set === undefined ? [] : [...set];
+}
+
+/** Restore this file's captured inline-namespace ranges from the side-channel. */
+export function applyCppInlineNamespaceSideChannel(
+  filePath: string,
+  ranges: readonly string[],
+): void {
+  if (ranges.length === 0) return;
+  let set = inlineNamespaceRangesByFile.get(filePath);
+  if (set === undefined) {
+    set = new Set();
+    inlineNamespaceRangesByFile.set(filePath, set);
+  }
+  for (const r of ranges) set.add(r);
 }
 
 /** Clear all inline-namespace state. Called from `clearFileLocalNames`. */
@@ -107,6 +132,7 @@ export function resolveCppQualifiedNamespaceMember(
   memberName: string,
   parsedFiles: readonly ParsedFile[],
   _scopes: ScopeResolutionIndexes,
+  callsite?: Callsite,
 ): SymbolDefinition | 'ambiguous' | undefined {
   const allHits: SymbolDefinition[] = [];
   const seenNodeId = new Set<string>();
@@ -132,19 +158,22 @@ export function resolveCppQualifiedNamespaceMember(
   if (allHits.length === 0) return undefined;
   if (allHits.length === 1) return allHits[0];
 
-  // Multi-candidate: the `resolveQualifiedReceiverMember` hook has no
-  // access to call-site arity or argument types, so
-  // `narrowOverloadCandidates` cannot actually narrow here — the call
-  // with `(allHits, undefined, undefined)` is effectively a pass-through.
-  // We retain it so that `isOverloadAmbiguousAfterNormalization` can
-  // still detect int/long-style normalization collisions on this path,
-  // but for any multi-hit case where candidates have genuinely distinct
-  // signatures (e.g. `foo(int)` vs `foo(double)` in different inline
-  // children), we conservatively suppress rather than pick arbitrarily.
-  // A future enhancement could thread call-site argument info through
-  // the `resolveQualifiedReceiverMember` contract to enable real
-  // narrowing here.
-  const narrowed = narrowOverloadCandidates(allHits, undefined, undefined);
+  // Multi-candidate: thread call-site arity/argument-types through the
+  // `resolveQualifiedReceiverMember` contract so `narrowOverloadCandidates`
+  // can disambiguate via exact-type match and, when available, conversion-rank
+  // scoring (`cppConversionRank`). Same-signature ambiguity is still detected
+  // by `isOverloadAmbiguousAfterNormalization` below.
+  const narrowed = narrowOverloadCandidates(
+    allHits,
+    callsite?.arity,
+    callsite?.argumentTypes,
+    callsite !== undefined
+      ? {
+          conversionRankFn: cppConversionRank,
+          conversionOnlyArgTypePrefixes: CPP_CONVERSION_ONLY_ARG_TYPE_PREFIXES,
+        }
+      : undefined,
+  );
   if (narrowed.length === 1) return narrowed[0];
   if (narrowed.length === 0) return undefined;
   if (isOverloadAmbiguousAfterNormalization(narrowed, undefined)) return 'ambiguous';

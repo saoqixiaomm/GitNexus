@@ -1,8 +1,223 @@
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
+import { execFileSync } from 'child_process';
+import { isMainThread } from 'worker_threads';
 import type lbug from '@ladybugdb/core';
 import { logger } from '../logger.js';
+
+// ─── Windows non-ASCII path workaround (#1811) ───────────────────────────────
+//
+// KuzuDB's native C++ layer on Windows uses CreateFileA (ANSI), not
+// CreateFileW. Non-ASCII path bytes from Node.js (UTF-8) are
+// misinterpreted via the system's Active Code Page (e.g. GBK), producing
+// a garbled path — "Error 3: The system cannot find the path."
+//
+// Layered workaround:
+//   1. Try 8.3 short-name form (fast, no persistent state)
+//   2. Fall back to an NTFS junction from an ASCII temp path
+//   3. If both fail, log a diagnostic and return the original path
+
+const NON_ASCII_RE = /[^\x00-\x7F]/;
+const JUNCTION_PREFIX = 'gitnexus-junction-';
+
+const activeJunctions = new Set<string>();
+let cleanupRegistered = false;
+let orphanScanDone = false;
+
+function junctionHash(targetDir: string): string {
+  return crypto.createHash('sha256').update(targetDir).digest('hex').slice(0, 16);
+}
+
+function tryShortPath(p: string): string | null {
+  try {
+    // Pass the path via environment variable so the command string is
+    // static — avoids CodeQL command-injection taint (the path never
+    // appears in the shell command text).
+    const result = execFileSync('cmd.exe', ['/c', 'for %I in ("%GITNEXUS_SP%") do @echo %~sI'], {
+      encoding: 'utf-8',
+      timeout: 5000,
+      windowsHide: true,
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, GITNEXUS_SP: p },
+    });
+    const shortPath = result.trim();
+    if (
+      shortPath &&
+      !NON_ASCII_RE.test(shortPath) &&
+      (!shortPath.includes('?') || p.includes('?'))
+    ) {
+      return shortPath;
+    }
+  } catch {
+    // 8.3 unavailable or cmd failed
+  }
+  return null;
+}
+
+function tryJunction(targetDir: string, leaf: string): string | null {
+  const hash = junctionHash(targetDir);
+  const junctionLink = path.join(os.tmpdir(), `${JUNCTION_PREFIX}${hash}`);
+
+  if (fsSync.existsSync(junctionLink)) {
+    try {
+      const existing = fsSync.readlinkSync(junctionLink);
+      if (path.resolve(existing) === path.resolve(targetDir)) {
+        activeJunctions.add(junctionLink);
+        return path.join(junctionLink, leaf);
+      }
+      fsSync.rmSync(junctionLink, { recursive: true, force: true });
+    } catch {
+      // Stale or broken junction — remove and recreate
+      try {
+        fsSync.rmSync(junctionLink, { recursive: true, force: true });
+      } catch {
+        /* best effort */
+      }
+    }
+  }
+
+  try {
+    fsSync.symlinkSync(targetDir, junctionLink, 'junction');
+    activeJunctions.add(junctionLink);
+    return path.join(junctionLink, leaf);
+  } catch (err: any) {
+    if (err.code === 'EEXIST') {
+      try {
+        const existing = fsSync.readlinkSync(junctionLink);
+        if (path.resolve(existing) === path.resolve(targetDir)) {
+          activeJunctions.add(junctionLink);
+          return path.join(junctionLink, leaf);
+        }
+      } catch {
+        /* cannot verify — fall through */
+      }
+    }
+  }
+  return null;
+}
+
+function registerCleanupHandlers(): void {
+  if (cleanupRegistered) return;
+  cleanupRegistered = true;
+
+  process.on('exit', () => cleanupNativePathJunctions());
+
+  for (const signal of ['SIGTERM', 'SIGINT'] as const) {
+    process.on(signal, () => {
+      cleanupNativePathJunctions();
+      if (process.platform === 'win32') {
+        process.exit(signal === 'SIGINT' ? 130 : 143);
+      } else {
+        process.kill(process.pid, signal);
+      }
+    });
+  }
+}
+
+function scanOrphanedJunctions(): void {
+  if (orphanScanDone) return;
+  orphanScanDone = true;
+  try {
+    const tmpdir = os.tmpdir();
+    const entries = fsSync.readdirSync(tmpdir);
+    for (const entry of entries) {
+      if (!entry.startsWith(JUNCTION_PREFIX)) continue;
+      const junctionPath = path.join(tmpdir, entry);
+      try {
+        const target = fsSync.readlinkSync(junctionPath);
+        try {
+          fsSync.lstatSync(target);
+        } catch {
+          fsSync.rmSync(junctionPath, { recursive: true, force: true });
+        }
+      } catch {
+        // Not a symlink/junction or unreadable — leave it
+      }
+    }
+  } catch {
+    // tmpdir unreadable — skip scan
+  }
+}
+
+export function cleanupNativePathJunctions(): void {
+  for (const junctionPath of activeJunctions) {
+    try {
+      fsSync.rmSync(junctionPath, { recursive: true, force: true });
+    } catch {
+      // Best effort — EPERM on Windows is common during exit
+    }
+  }
+  activeJunctions.clear();
+}
+
+export function toNativeSafePath(p: string): string {
+  if (process.platform !== 'win32') return p;
+  if (!NON_ASCII_RE.test(p)) return p;
+
+  if (isMainThread) {
+    scanOrphanedJunctions();
+    registerCleanupHandlers();
+  }
+
+  const shortPath = tryShortPath(p);
+  if (shortPath) return shortPath;
+
+  if (!isMainThread) {
+    logger.warn(
+      `GitNexus: non-ASCII path in worker thread — junction fallback skipped. ` +
+        `Path: "${p}". 8.3 short names may need to be enabled on this volume.`,
+    );
+    return p;
+  }
+
+  const targetDir = path.dirname(p);
+  const leaf = path.basename(p);
+  if (fsSync.existsSync(targetDir)) {
+    const junctionResult = tryJunction(targetDir, leaf);
+    if (junctionResult) return junctionResult;
+  }
+
+  logger.warn(
+    `GitNexus: non-ASCII path "${p}" could not be converted to an ASCII-safe form. ` +
+      'LadybugDB may fail with "Cannot open file." To fix: move the repo to a path ' +
+      'without CJK/Unicode characters, or enable 8.3 short names on this volume ' +
+      '(fsutil 8dot3name set 0).',
+  );
+  return p;
+}
+
+/**
+ * Resolve the on-disk CSV staging dir for `<storagePath>/<subdir>`, applying the
+ * same ASCII-safe relocation `toNativeSafePath` enables: on Windows with a
+ * non-ASCII storage path, LadybugDB's bulk COPY cannot open files under that
+ * path, so the dir is relocated under `os.tmpdir()`. Shared by the structural
+ * `csv/` dir and the streaming `pdg-csv/` dir (#2202) so the two can never
+ * diverge on platform handling; the `gitnexus-<subdir>-` prefix keeps their tmp
+ * locations distinct and recognizable.
+ *
+ * The relocated dir is created with `fs.mkdtempSync` (a unique, mode-0700,
+ * guaranteed-not-pre-existing suffix) rather than a deterministic
+ * `gitnexus-<subdir>-<hash>` name. A predictable name in the world-readable OS
+ * temp dir is information-disclosure-prone and pre-plantable
+ * (CWE-377/378 / CodeQL `js/insecure-temporary-file`); mkdtemp's random suffix
+ * is the documented mitigation and is what reaches the streaming sink's
+ * `fs.openSync`. The non-Windows / ASCII path stays a pure `path.join` (no dir
+ * created) and is byte-identical to before.
+ */
+export function resolveNativeSafeStorageDir(storagePath: string, subdir: string): string {
+  if (process.platform === 'win32' && NON_ASCII_RE.test(storagePath)) {
+    // 8.3-shorten the tmpdir base first (a non-ASCII Windows *profile* path can
+    // make os.tmpdir() itself non-ASCII), THEN mkdtemp so the returned path —
+    // the one that flows into fs.openSync — is provably mkdtemp-sourced (random,
+    // exclusive) and clears the insecure-temp-file dataflow.
+    const base = toNativeSafePath(os.tmpdir());
+    return fsSync.mkdtempSync(path.join(base, `gitnexus-${subdir}-`));
+  }
+  return path.join(storagePath, subdir);
+}
 
 /**
  * Shared configuration for `@ladybugdb/core` `Database` construction.
@@ -351,12 +566,10 @@ export async function openLbugConnection(
   databasePath: string,
   options: LbugDatabaseOptions = {},
 ): Promise<LbugConnectionHandle> {
+  const safePath = toNativeSafePath(databasePath);
   let db: lbug.Database | undefined;
   try {
-    db = await openWithLockRetry(
-      () => createLbugDatabase(lbugModule, databasePath, options),
-      databasePath,
-    );
+    db = await openWithLockRetry(() => createLbugDatabase(lbugModule, safePath, options), safePath);
     return { db, conn: new lbugModule.Connection(db) };
   } catch (err) {
     if (db) await db.close().catch(() => {});

@@ -131,6 +131,7 @@ describe('Blade/template static route extraction', () => {
           },
         ],
         allDecoratorRoutes: [],
+        routeHandlerSymbols: new Map(),
       } as unknown as ParseOutput;
 
       const output = await routesPhase.execute(
@@ -146,6 +147,7 @@ describe('Blade/template static route extraction', () => {
       expect(output.routeRegistry.get('/admin/orders')).toEqual({
         filePath: 'routes/web.php',
         source: 'framework-route',
+        method: 'POST',
       });
 
       const fetchEdges = graph.relationships.filter((rel) => rel.type === 'FETCHES');

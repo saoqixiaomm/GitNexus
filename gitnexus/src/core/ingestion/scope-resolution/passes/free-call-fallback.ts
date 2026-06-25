@@ -35,11 +35,12 @@ import type {
   ResolutionSuppressionReason,
 } from '../resolution-outcome.js';
 import { resolveCallerGraphId, resolveDefGraphId } from '../graph-bridge/ids.js';
+import type { CalleeIdSink } from '../graph-bridge/callee-id-sink.js';
 import {
   findAllCallableBindingsInScope,
   findCallableBindingInScope,
   findCallableBindingsAndAdlBlocker,
-  findClassBindingInScope,
+  resolveInheritanceBaseInScope,
 } from '../scope/walkers.js';
 import {
   isOverloadAmbiguousAfterNormalization,
@@ -58,6 +59,9 @@ export function emitFreeCallFallback(
   workspaceIndex: WorkspaceResolutionIndex,
   options: {
     readonly allowGlobalFallback?: boolean;
+    /** When true, `Type(...)` constructor calls link to the Class def
+     *  itself rather than its explicit Constructor. Swift opts in. */
+    readonly constructorCallTargetsClass?: boolean;
     readonly isFileLocalDef?: (def: SymbolDefinition) => boolean;
     readonly isCallableVisibleFromCaller?: (ctx: {
       readonly callerParsed: ParsedFile;
@@ -77,6 +81,7 @@ export function emitFreeCallFallback(
       parsedFiles: readonly ParsedFile[],
     ) => readonly SymbolDefinition[] | undefined;
     readonly conversionRankFn?: ConversionRankFn;
+    readonly conversionOnlyArgTypePrefixes?: readonly string[];
     /** Optional per-language constraint hook threaded into
      *  `narrowOverloadCandidates`. Drops candidates whose template
      *  constraints (e.g. C++ `enable_if_t`, C++20 `requires`) provably
@@ -84,6 +89,11 @@ export function emitFreeCallFallback(
      *  candidate (monotonicity). */
     readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
     readonly recordResolutionOutcome?: ResolutionOutcomeRecorder;
+    /** Resolved-callee-id capture sink (#2227 U2). Threaded in only under
+     *  `--pdg`; `undefined` ⇒ zero overhead, byte-identity (R4). Captured at
+     *  the CALLS emit below BEFORE the collapsed `seen` dedup (KTD6) so
+     *  same-target multi-line calls are still recorded per site. */
+    readonly calleeIdSink?: CalleeIdSink;
   } = {},
 ): number {
   let emitted = 0;
@@ -94,6 +104,20 @@ export function emitFreeCallFallback(
   // per call site. Same name + callable-kind filter that the previous scan
   // applied (see pickUniqueGlobalCallable JSDoc). Cost: O(|defs|) once.
   const globalCallablesBySimpleName = buildGlobalCallableIndex(scopes);
+  // Sibling index for constructor-form class fallback. Built once here so
+  // pickUniqueGlobalClass is O(1)-per-site rather than re-scanning
+  // defs.byId.values() at every constructor call. Same simple-name keying
+  // and class-like kind filter the previous per-site scan applied.
+  const globalClassesBySimpleName = buildGlobalClassIndex(scopes);
+  // Per-pass memo of pickUniqueGlobalCallable's post-filter candidate list,
+  // keyed (simpleName, callerFilePath). Only created when no per-caller
+  // visibility filter applies (the list is then a pure function of name+file —
+  // see pickUniqueGlobalCallable). Lets repeated free calls of the same name
+  // from one file reuse the same-name-bucket scan instead of re-walking it.
+  const scopeDefsCache =
+    options.isCallableVisibleFromCaller === undefined
+      ? new Map<string, readonly SymbolDefinition[]>()
+      : undefined;
 
   for (const parsed of parsedFiles) {
     for (const site of parsed.referenceSites) {
@@ -106,9 +130,36 @@ export function emitFreeCallFallback(
       // the same two targets; see test expectations.
       let fnDef: SymbolDefinition | undefined;
       if (site.callForm === 'constructor') {
-        const classDef = findClassBindingInScope(site.inScope, site.name, scopes);
-        if (classDef !== undefined) {
-          fnDef = pickConstructorOrClass(classDef, workspaceIndex);
+        const classDef = resolveInheritanceBaseInScope(
+          site.inScope,
+          site.name,
+          scopes,
+          site.rawQualifiedName,
+        );
+        if (classDef !== undefined && classDef.type !== 'Interface') {
+          // Most languages link `Type(...)` to the explicit Constructor def
+          // when one exists (else the Class). Languages that model the call
+          // as a reference to the type itself opt into
+          // `constructorCallTargetsClass` and always link to the Class.
+          fnDef =
+            options.constructorCallTargetsClass === true
+              ? classDef
+              : pickConstructorOrClass(classDef, workspaceIndex, scopes, site.arity);
+        } else if (options.allowGlobalFallback === true) {
+          // The constructed type may live in a sibling/imported file that is
+          // not in the call-site's lexical scope-chain bindings. Fall back to
+          // a unique workspace-wide Class def by simple name (gated on the
+          // same global-fallback opt-in as free calls). Then target the
+          // Class or its Constructor per the language's preference.
+          const globalClass = pickUniqueGlobalClass(site.name, globalClassesBySimpleName);
+          if (globalClass !== undefined) {
+            fnDef =
+              globalClass.type === 'Interface'
+                ? undefined
+                : options.constructorCallTargetsClass === true
+                  ? globalClass
+                  : pickConstructorOrClass(globalClass, workspaceIndex, scopes, site.arity);
+          }
         }
       }
       // Implicit-this overload narrowing: an unqualified call inside
@@ -116,11 +167,14 @@ export function emitFreeCallFallback(
       // enclosing class. When the workspace has multiple methods of
       // the same name in a single class, choose the best match by
       // arity + argument types.
+      let fnDefFromImplicitThis = false;
       if (fnDef === undefined) {
         fnDef = pickImplicitThisOverload(site, scopes, workspaceIndex, model, {
           conversionRankFn: options.conversionRankFn,
+          conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
           constraintCompatibility: options.constraintCompatibility,
         });
+        fnDefFromImplicitThis = fnDef !== undefined;
       }
       // Scope-chain callable lookup. First-match preserves scope-chain
       // precedence (local shadows import). When a conversion-rank function
@@ -145,6 +199,7 @@ export function emitFreeCallFallback(
                 {
                   argumentTypeClasses: site.argumentTypeClasses,
                   conversionRankFn: options.conversionRankFn,
+                  conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
                   constraintCompatibility: options.constraintCompatibility,
                 },
               );
@@ -231,6 +286,7 @@ export function emitFreeCallFallback(
               const narrowed = narrowOverloadCandidates(ordinary, site.arity, site.argumentTypes, {
                 argumentTypeClasses: site.argumentTypeClasses,
                 conversionRankFn: options.conversionRankFn,
+                conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
                 constraintCompatibility: options.constraintCompatibility,
               });
               if (narrowed.length === 1) {
@@ -278,6 +334,7 @@ export function emitFreeCallFallback(
             const narrowed = narrowOverloadCandidates(merged, site.arity, site.argumentTypes, {
               argumentTypeClasses: site.argumentTypeClasses,
               conversionRankFn: options.conversionRankFn,
+              conversionOnlyArgTypePrefixes: options.conversionOnlyArgTypePrefixes,
               constraintCompatibility: options.constraintCompatibility,
             });
             if (narrowed.length === 1) {
@@ -333,10 +390,37 @@ export function emitFreeCallFallback(
           site.argumentTypes,
           site.argumentTypeClasses,
           options.conversionRankFn,
+          scopeDefsCache,
+          options.conversionOnlyArgTypePrefixes,
         );
       }
       if (fnDef === undefined) continue;
-      const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup);
+      if (fnDef.isDeleted === true) {
+        recordSuppressedOutcome(options.recordResolutionOutcome, {
+          phase: 'free-call-fallback',
+          filePath: parsed.filePath,
+          name: site.name,
+          range: site.atRange,
+          reason: 'selected-callable-deleted',
+          candidates: [fnDef],
+        });
+        handledSites.add(siteKey(parsed.filePath, site));
+        continue;
+      }
+      if (
+        (fnDefFromImplicitThis || fnDef.type === 'Method' || fnDef.type === 'Constructor') &&
+        options.isCallableVisibleFromCaller !== undefined &&
+        !options.isCallableVisibleFromCaller({
+          callerParsed: parsed,
+          candidate: fnDef,
+          callerScope: site.inScope,
+          scopes,
+        })
+      ) {
+        handledSites.add(siteKey(parsed.filePath, site));
+        continue;
+      }
+      const callerGraphId = resolveCallerGraphId(site.inScope, scopes, nodeLookup, site.atRange);
       if (callerGraphId === undefined) continue;
       const tgtGraphId = resolveDefGraphId(fnDef.filePath, fnDef, nodeLookup);
       if (tgtGraphId === undefined) continue;
@@ -344,6 +428,18 @@ export function emitFreeCallFallback(
       // means we don't add a new edge — so `emit-references` skips its
       // potentially-wrong fallback for the same site.
       handledSites.add(siteKey(parsed.filePath, site));
+      // Resolved-callee-id capture (#2227 U2/KTD6/R8): record this CALLS site's
+      // resolved target BEFORE the collapsed `seen` dedup. The free-call dedup
+      // key drops the line (one edge per caller→target), so capturing after
+      // `seen.has` would lose every same-target call past the first — capture
+      // here, per site, keyed on `site.atRange` (byte-equal to U1's
+      // SiteRecord.at: 1-based line / 0-based col).
+      options.calleeIdSink?.add(
+        parsed.filePath,
+        site.atRange.startLine,
+        site.atRange.startCol,
+        tgtGraphId,
+      );
       const relId = `rel:CALLS:${callerGraphId}->${tgtGraphId}`;
       if (seen.has(relId)) continue;
       seen.add(relId);
@@ -425,8 +521,11 @@ function recordSuppressedOutcome(
  * (falling back to the qualifiedName itself when undotted). Used by
  * `pickUniqueGlobalCallable` so every free-call fallback site is O(1)
  * instead of O(|defs|).
+ *
+ * Exported for unit testing — language-agnostic logic, exercised via synthetic
+ * stubs in `pick-unique-global-callable.test.ts`.
  */
-function buildGlobalCallableIndex(
+export function buildGlobalCallableIndex(
   scopes: ScopeResolutionIndexes,
 ): ReadonlyMap<string, readonly SymbolDefinition[]> {
   const out = new Map<string, SymbolDefinition[]>();
@@ -443,7 +542,53 @@ function buildGlobalCallableIndex(
   return out;
 }
 
-function pickUniqueGlobalCallable(
+/**
+ * Build a `simpleName -> class-like defs` index from `scopes.defs` once per
+ * pass — the structural sibling of `buildGlobalCallableIndex`, consumed by
+ * `pickUniqueGlobalClass` so constructor-form fallback is O(1)-per-site
+ * instead of O(|defs|).
+ *
+ * **Kind filter (KTD5 — KEEP `'Interface'`):** the set is
+ * `Class | Struct | Interface`, matching the idiomatic class-like set used
+ * elsewhere in the scope-resolution bridge (`graph-bridge/ids.ts`,
+ * `node-lookup.ts`). This is a behavior-PRESERVING perf refactor for all 8
+ * `allowGlobalFreeCallFallback` languages — the previous per-site scan used
+ * exactly this filter. Excluding Swift `protocol` (`Interface`) defs because
+ * protocols aren't instantiable is a *separate* Swift-semantics question with
+ * its own test; dropping `Interface` here would be a deliberate
+ * behavior-changing edit, not part of U5.
+ *
+ * Bucket insertion order follows `defs.byId.values()` iteration order, so the
+ * downstream "keep first" / ambiguity ordering in `pickUniqueGlobalClass` is
+ * byte-identical to the old linear scan (equivalence verified).
+ *
+ * Exported for unit testing — language-agnostic logic, exercised via synthetic
+ * stubs in `pick-unique-global-class.test.ts`.
+ */
+export function buildGlobalClassIndex(
+  scopes: ScopeResolutionIndexes,
+): ReadonlyMap<string, readonly SymbolDefinition[]> {
+  const out = new Map<string, SymbolDefinition[]>();
+  for (const def of scopes.defs.byId.values()) {
+    if (def.type !== 'Class' && def.type !== 'Struct' && def.type !== 'Interface') continue;
+    const qualified = def.qualifiedName;
+    if (qualified === undefined || qualified.length === 0) continue;
+    const dot = qualified.lastIndexOf('.');
+    const simple = dot === -1 ? qualified : qualified.slice(dot + 1);
+    const bucket = out.get(simple);
+    if (bucket) bucket.push(def);
+    else out.set(simple, [def]);
+  }
+  return out;
+}
+
+/**
+ * Resolve a free (unqualified, receiver-less) call to a globally-unique
+ * callable def by simple name. See the in-body comments for the narrowing
+ * order. Exported for unit testing — the `scopeDefsCache` equivalence is
+ * exercised via synthetic stubs in `pick-unique-global-callable.test.ts`.
+ */
+export function pickUniqueGlobalCallable(
   name: string,
   model: SemanticModel,
   globalCallablesBySimpleName: ReadonlyMap<string, readonly SymbolDefinition[]>,
@@ -454,26 +599,50 @@ function pickUniqueGlobalCallable(
   callArgTypes?: readonly string[],
   callArgTypeClasses?: readonly ParameterTypeClass[],
   conversionRankFn?: ConversionRankFn,
+  scopeDefsCache?: Map<string, readonly SymbolDefinition[]>,
+  conversionOnlyArgTypePrefixes?: readonly string[],
 ): SymbolDefinition | undefined {
-  const scopeDefs: SymbolDefinition[] = [];
-  const scopeSeen = new Set<string>();
-  for (const def of globalCallablesBySimpleName.get(name) ?? []) {
-    // Skip file-local defs (e.g. C `static` functions) that live in a
-    // different file from the caller — they are logically invisible.
-    if (isFileLocalDef !== undefined && def.filePath !== callerFilePath && isFileLocalDef(def)) {
-      continue;
+  // The scope-index candidate list is a pure function of (name, callerFilePath):
+  // the same-name bucket is fixed for the pass, the file-local filter depends
+  // only on the candidate + callerFilePath, and the logical-key dedup is
+  // deterministic. When no per-caller visibility filter applies, memoize it so
+  // repeated free calls of the same name from one file — the kernel's hot
+  // pattern (e.g. `kmalloc` across hundreds of `drivers/` sites, where the
+  // same-name bucket has thousands of defs) — reuse the bucket scan instead of
+  // re-walking it per site. The cached array is only ever READ by the arity /
+  // overload narrowers below (both `.filter()`-based — they never mutate it),
+  // so one shared instance across call sites is safe. The cache is bypassed
+  // when a visibility filter is present (`isCallerVisible !== undefined`),
+  // because the list would then depend on the caller's scope, not just its file.
+  const cacheKey =
+    scopeDefsCache !== undefined && isCallerVisible === undefined
+      ? `${name} ${callerFilePath}`
+      : undefined;
+  let scopeDefs: readonly SymbolDefinition[] | undefined =
+    cacheKey !== undefined ? scopeDefsCache!.get(cacheKey) : undefined;
+  if (scopeDefs === undefined) {
+    const built: SymbolDefinition[] = [];
+    const scopeSeen = new Set<string>();
+    for (const def of globalCallablesBySimpleName.get(name) ?? []) {
+      // Skip file-local defs (e.g. C `static` functions) that live in a
+      // different file from the caller — they are logically invisible.
+      if (isFileLocalDef !== undefined && def.filePath !== callerFilePath && isFileLocalDef(def)) {
+        continue;
+      }
+      // Caller-side visibility filter (e.g., PHP namespace + use-function
+      // import gating). When defined, blocks candidates the caller cannot
+      // legally reach. Languages without namespace-scoped function resolution
+      // leave this undefined → no filtering.
+      if (isCallerVisible !== undefined && !isCallerVisible(def)) {
+        continue;
+      }
+      const key = logicalCallableKey(def);
+      if (scopeSeen.has(key)) continue;
+      scopeSeen.add(key);
+      built.push(def);
     }
-    // Caller-side visibility filter (e.g., PHP namespace + use-function
-    // import gating). When defined, blocks candidates the caller cannot
-    // legally reach. Languages without namespace-scoped function resolution
-    // leave this undefined → no filtering.
-    if (isCallerVisible !== undefined && !isCallerVisible(def)) {
-      continue;
-    }
-    const key = logicalCallableKey(def);
-    if (scopeSeen.has(key)) continue;
-    scopeSeen.add(key);
-    scopeDefs.push(def);
+    scopeDefs = built;
+    if (cacheKey !== undefined) scopeDefsCache!.set(cacheKey, built);
   }
   if (scopeDefs.length === 1) return scopeDefs[0];
 
@@ -493,6 +662,7 @@ function pickUniqueGlobalCallable(
     const narrowed = narrowOverloadCandidates(scopeDefs, callArity, callArgTypes, {
       argumentTypeClasses: callArgTypeClasses,
       conversionRankFn,
+      conversionOnlyArgTypePrefixes,
     });
     if (narrowed.length === 1) return narrowed[0];
   }
@@ -534,6 +704,7 @@ function pickUniqueGlobalCallable(
     const narrowed = narrowOverloadCandidates(defs, callArity, callArgTypes, {
       argumentTypeClasses: callArgTypeClasses,
       conversionRankFn,
+      conversionOnlyArgTypePrefixes,
     });
     if (narrowed.length === 1) return narrowed[0];
   }
@@ -578,13 +749,64 @@ function logicalCallableKey(def: SymbolDefinition): string {
 function pickConstructorOrClass(
   classDef: SymbolDefinition,
   workspaceIndex: WorkspaceResolutionIndex,
+  scopes?: ScopeResolutionIndexes,
+  callArity?: number,
 ): SymbolDefinition {
   const classScope = workspaceIndex.classScopeByDefId.get(classDef.nodeId);
   if (classScope === undefined) return classDef;
+  const ctors: SymbolDefinition[] = [];
   for (const def of classScope.ownedDefs) {
-    if (def.type === 'Constructor') return def;
+    if (def.type === 'Constructor') ctors.push(def);
   }
-  return classDef;
+  if (scopes !== undefined) {
+    for (const childId of scopes.scopeTree.getChildren(classScope.id)) {
+      const childScope = scopes.scopeTree.getScope(childId);
+      if (childScope === undefined || childScope.kind === 'Class') continue;
+      for (const def of childScope.ownedDefs) {
+        if (def.type === 'Constructor') ctors.push(def);
+      }
+    }
+  }
+  if (ctors.length === 0) return classDef;
+  if (callArity !== undefined) {
+    const narrowed = narrowByArity(ctors, callArity);
+    if (narrowed !== undefined) return narrowed;
+  }
+  return ctors[0]!;
+}
+
+/** Find a unique workspace-wide class-like def by simple name, for a
+ *  constructor-form call `Type(...)` whose type lives outside the call
+ *  site's lexical bindings (a sibling/imported file). Returns the def
+ *  only when all matches share ONE qualified name — i.e. they are
+ *  fragments of a single logical type (partial classes / extensions
+ *  that re-key onto the same type), which resolve to the same graph
+ *  node. Genuinely distinct types with the same simple name are
+ *  ambiguous and leave the call unresolved rather than guessing. Gated
+ *  by the caller on `allowGlobalFallback`, mirroring
+ *  `pickUniqueGlobalCallable`.
+ *
+ *  Consumes the once-built `buildGlobalClassIndex` (`simpleName ->
+ *  class-like defs`) so each call site is O(1) rather than O(|defs|).
+ *  The index's `Class | Struct | Interface` kind filter is intentionally
+ *  KEPT (KTD5) — see `buildGlobalClassIndex` for why dropping `Interface`
+ *  would be a separate, behavior-changing Swift-semantics edit.
+ *
+ *  Exported for unit testing — language-agnostic logic, exercised via
+ *  synthetic stubs in `pick-unique-global-class.test.ts`. The production
+ *  call site is the constructor-form fallback in `emitFreeCallFallback`. */
+export function pickUniqueGlobalClass(
+  name: string,
+  index: ReadonlyMap<string, readonly SymbolDefinition[]>,
+): SymbolDefinition | undefined {
+  let found: SymbolDefinition | undefined;
+  for (const def of index.get(name) ?? []) {
+    // Same qualified name = same logical type (extension / partial-class
+    // fragment); keep the first and don't treat it as ambiguous.
+    if (found !== undefined && found.qualifiedName !== def.qualifiedName) return undefined;
+    if (found === undefined) found = def;
+  }
+  return found;
 }
 
 /** Walk up from the call-site scope to the enclosing class scope,
@@ -613,6 +835,7 @@ export function pickImplicitThisOverload(
   model: SemanticModel,
   hookCtx?: {
     readonly conversionRankFn?: ConversionRankFn;
+    readonly conversionOnlyArgTypePrefixes?: readonly string[];
     readonly constraintCompatibility?: ScopeResolver['constraintCompatibility'];
   },
 ): SymbolDefinition | undefined {
@@ -645,6 +868,7 @@ export function pickImplicitThisOverload(
   const candidates = narrowOverloadCandidates(overloads, site.arity, site.argumentTypes, {
     argumentTypeClasses: site.argumentTypeClasses,
     conversionRankFn: hookCtx?.conversionRankFn,
+    conversionOnlyArgTypePrefixes: hookCtx?.conversionOnlyArgTypePrefixes,
     constraintCompatibility: hookCtx?.constraintCompatibility,
   });
   if (candidates.length !== 1) return undefined;

@@ -18,7 +18,6 @@ import { scalaTypeConfig } from '../type-extractors/jvm.js';
 import { scalaExportChecker } from '../export-detection.js';
 import { createImportResolver } from '../import-resolvers/resolver-factory.js';
 import { scalaImportConfig } from '../import-resolvers/configs/jvm.js';
-import { extractScalaNamedBindings } from '../named-bindings/scala.js';
 import { SCALA_QUERIES } from '../tree-sitter-queries.js';
 import { createFieldExtractor } from '../field-extractors/generic.js';
 import { scalaConfig } from '../field-extractors/configs/scala.js';
@@ -208,7 +207,6 @@ export const scalaProvider = defineLanguage({
   typeConfig: scalaTypeConfig,
   exportChecker: scalaExportChecker,
   importResolver: createImportResolver(scalaImportConfig),
-  namedBindingExtractor: extractScalaNamedBindings,
   mroStrategy: 'implements-split',
   fieldExtractor: createFieldExtractor(scalaConfig),
   methodExtractor: createMethodExtractor(scalaMethodConfig),

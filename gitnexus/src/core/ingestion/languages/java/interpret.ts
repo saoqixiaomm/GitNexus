@@ -24,11 +24,13 @@ export function interpretJavaImport(captures: CaptureMatch): ParsedImport | null
   switch (kind) {
     case 'named': {
       // `import com.example.User;`
+      const simpleName = sourceCap.text.split('.').pop() ?? sourceCap.text;
       return {
         kind: 'named',
-        localName: nameCap?.text ?? sourceCap.text.split('.').pop() ?? sourceCap.text,
-        importedName: sourceCap.text,
+        localName: nameCap?.text ?? simpleName,
+        importedName: simpleName,
         targetRaw: sourceCap.text,
+        targetIncludesImportedName: true,
       };
     }
     case 'wildcard': {
@@ -40,17 +42,14 @@ export function interpretJavaImport(captures: CaptureMatch): ParsedImport | null
     }
     case 'static': {
       // `import static com.example.Utils.format;`
-      // The source contains the full path including the member name
-      // (e.g. `com.example.Utils.format`).  For file resolution we need
-      // the class path (`com.example.Utils`), so strip the final member
-      // segment.  The local binding name is the member itself.
       const fullSource = sourceCap.text;
       const lastDot = fullSource.lastIndexOf('.');
+      const memberName = lastDot >= 0 ? fullSource.slice(lastDot + 1) : fullSource;
       const classPath = lastDot >= 0 ? fullSource.slice(0, lastDot) : fullSource;
       return {
         kind: 'named',
-        localName: nameCap?.text ?? (lastDot >= 0 ? fullSource.slice(lastDot + 1) : fullSource),
-        importedName: fullSource,
+        localName: nameCap?.text ?? memberName,
+        importedName: memberName,
         targetRaw: classPath,
       };
     }
@@ -76,10 +75,14 @@ export function interpretJavaTypeBinding(captures: CaptureMatch): ParsedTypeBind
   const typeCap = captures['@type-binding.type'];
   if (nameCap === undefined || typeCap === undefined) return null;
 
-  // Strip qualifier first so that `com.example.BaseModel<T>` becomes
-  // `BaseModel<T>` before stripGeneric — the JVM-erasure fallback pattern
-  // requires an unqualified identifier at the start of the string.
-  const rawType = stripGeneric(stripQualifier(typeCap.text.trim()));
+  // Strip generics BEFORE the qualifier (F41 #1928). Stripping the qualifier
+  // first uses `lastIndexOf('.')`, which for a qualified *type argument*
+  // (`Map<String, com.example.User>`) cuts inside the generic and yields a
+  // corrupted `User>`. Unwrapping generics first reduces the string to a single
+  // (possibly qualified) class name, then the qualifier strip leaves the bare
+  // simple name. `stripGeneric`'s erasure fallback is qualifier-tolerant so a
+  // qualified generic base (`com.example.BaseModel<T>`) still reduces correctly.
+  const rawType = stripQualifier(stripGeneric(typeCap.text.trim()));
 
   // Skip `var` — tree-sitter-java parses `var` as type_identifier with
   // text "var". When used without a constructor initializer, there's no
@@ -89,6 +92,9 @@ export function interpretJavaTypeBinding(captures: CaptureMatch): ParsedTypeBind
   let source: TypeRef['source'] = 'parameter-annotation';
   if (captures['@type-binding.self'] !== undefined) source = 'self';
   else if (captures['@type-binding.constructor'] !== undefined) source = 'constructor-inferred';
+  else if (captures['@type-binding.pattern'] !== undefined) source = 'annotation';
+  else if (captures['@type-binding.call-result'] !== undefined) source = 'annotation';
+  else if (captures['@type-binding.alias'] !== undefined) source = 'annotation';
   else if (captures['@type-binding.annotation'] !== undefined) source = 'annotation';
   else if (captures['@type-binding.return'] !== undefined) source = 'return-annotation';
 
@@ -126,8 +132,10 @@ function stripGeneric(text: string): string {
   // `BaseModel<T>` → `BaseModel`, `Builder<Self>` → `Builder`.
   // This mirrors JVM type erasure — the raw class name is the resolvable symbol.
   // The pattern matches up to the first `<` to handle nested generics safely
-  // (e.g. `BaseModel<List<String>>` → `BaseModel`).
-  const fallback = text.match(/^([A-Za-z_$][A-Za-z0-9_$]*)<.+>$/s);
+  // (e.g. `BaseModel<List<String>>` → `BaseModel`). The base is allowed to be
+  // qualified (`com.example.BaseModel<T>` → `com.example.BaseModel`) since the
+  // caller strips the qualifier afterwards (F41 #1928).
+  const fallback = text.match(/^((?:[A-Za-z_$][A-Za-z0-9_$]*\.)*[A-Za-z_$][A-Za-z0-9_$]*)<.+>$/s);
   if (fallback !== null) return fallback[1].trim();
 
   return text;
