@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import { parentPort, threadId, workerData } from 'node:worker_threads';
 import Parser from 'tree-sitter';
 import JavaScript from 'tree-sitter-javascript';
@@ -38,6 +39,8 @@ import type {
 /** Language grammar type accepted by Parser.setLanguage(). */
 type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
 
+const _require = createRequire(import.meta.url);
+
 // ── Worker grammar loading — enforcement boundary (#2091/#2093, #2101) ───────
 // The worker maintains its own grammar table (the guarded vendored-grammar
 // loads below + `languageMap`) and intentionally does NOT consult the runtime
@@ -52,10 +55,11 @@ type TreeSitterLanguage = Parameters<typeof Parser.prototype.setLanguage>[0];
 // — routing this table through `parser-loader.getLanguageGrammar` so there is
 // one loader — is the deferred Tier-1 consolidation.)
 // Swift/Dart/Kotlin/C are vendored grammars loaded from `vendor/` by absolute
-// path (NEVER copied into node_modules — see vendored-grammars.ts / #2111). Each
-// may be absent on a platform without a prebuild or a toolchain-less /
-// `--ignore-scripts` install, so every load is guarded so a missing binding
-// cannot crash the worker at module-load (#2091/#2093, #2116).
+// path (NEVER copied into node_modules — see vendored-grammars.ts / #2111).
+// Scala is an optional npm dependency loaded via createRequire. Each may be
+// absent on a platform without a prebuild or a toolchain-less / `--ignore-scripts`
+// install, so every load is guarded so a missing binding cannot crash the worker
+// at module-load (#2091/#2093, #2116).
 let Swift: TreeSitterLanguage | null = null;
 try {
   Swift = requireVendoredGrammar('tree-sitter-swift') as TreeSitterLanguage;
@@ -74,6 +78,11 @@ try {
 let C: TreeSitterLanguage | null = null;
 try {
   C = requireVendoredGrammar('tree-sitter-c') as TreeSitterLanguage;
+} catch {}
+
+let Scala: TreeSitterLanguage | null = null;
+try {
+  Scala = _require('tree-sitter-scala') as TreeSitterLanguage;
 } catch {}
 import { getLanguageFromFilename } from 'gitnexus-shared';
 import {
@@ -467,6 +476,7 @@ const languageMap: Record<string, TreeSitterLanguage> = {
   [SupportedLanguages.Go]: Go,
   [SupportedLanguages.Rust]: Rust,
   ...(Kotlin ? { [SupportedLanguages.Kotlin]: Kotlin } : {}),
+  ...(Scala ? { [SupportedLanguages.Scala]: Scala } : {}),
   [SupportedLanguages.PHP]: PHP.php_only,
   [SupportedLanguages.Ruby]: Ruby,
   [SupportedLanguages.Vue]: TypeScript.typescript,
