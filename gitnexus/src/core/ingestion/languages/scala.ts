@@ -12,7 +12,7 @@
  * pattern matching, for-comprehensions, infix operators, package objects.
  */
 
-import { SupportedLanguages } from 'gitnexus-shared';
+import { SupportedLanguages, type NodeLabel } from 'gitnexus-shared';
 import { defineLanguage } from '../language-provider.js';
 import { scalaTypeConfig } from '../type-extractors/jvm.js';
 import { scalaExportChecker } from '../export-detection.js';
@@ -23,8 +23,23 @@ import { createFieldExtractor } from '../field-extractors/generic.js';
 import { scalaConfig } from '../field-extractors/configs/scala.js';
 import { createMethodExtractor } from '../method-extractors/generic.js';
 import { scalaMethodConfig } from '../method-extractors/configs/scala.js';
+import { createCallExtractor } from '../call-extractors/generic.js';
+import { scalaCallConfig } from '../call-extractors/configs/jvm.js';
+import { createClassExtractor } from '../class-extractors/generic.js';
+import { scalaClassConfig } from '../class-extractors/configs/jvm.js';
+import { createVariableExtractor } from '../variable-extractors/generic.js';
+import { scalaVariableConfig } from '../variable-extractors/configs/jvm.js';
+import {
+  emitScalaScopeCaptures,
+  interpretScalaImport,
+  interpretScalaTypeBinding,
+  scalaArityCompatibility,
+  scalaBindingScopeFor,
+  scalaImportOwningScope,
+  scalaMergeBindings,
+  scalaReceiverBinding,
+} from './scala/index.js';
 import type { SyntaxNode } from '../utils/ast-helpers.js';
-import type { NodeLabel } from 'gitnexus-shared';
 
 const BUILT_INS: ReadonlySet<string> = new Set([
   // I/O and assertions
@@ -208,8 +223,19 @@ export const scalaProvider = defineLanguage({
   exportChecker: scalaExportChecker,
   importResolver: createImportResolver(scalaImportConfig),
   mroStrategy: 'implements-split',
+  callExtractor: createCallExtractor(scalaCallConfig),
+  classExtractor: createClassExtractor(scalaClassConfig),
   fieldExtractor: createFieldExtractor(scalaConfig),
   methodExtractor: createMethodExtractor(scalaMethodConfig),
+  variableExtractor: createVariableExtractor(scalaVariableConfig),
+  emitScopeCaptures: emitScalaScopeCaptures,
+  interpretImport: interpretScalaImport,
+  interpretTypeBinding: interpretScalaTypeBinding,
+  bindingScopeFor: scalaBindingScopeFor,
+  importOwningScope: scalaImportOwningScope,
+  mergeBindings: (_scope, bindings) => scalaMergeBindings(bindings),
+  receiverBinding: scalaReceiverBinding,
+  arityCompatibility: scalaArityCompatibility,
   builtInNames: BUILT_INS,
 
   importPathPreprocessor: (cleaned, _importNode) => {

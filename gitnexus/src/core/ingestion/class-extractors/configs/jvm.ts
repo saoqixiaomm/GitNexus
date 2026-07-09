@@ -38,3 +38,29 @@ export const kotlinClassConfig: ClassExtractionConfig = {
     return node.children.some((child) => child?.text === 'interface') ? 'Interface' : 'Class';
   },
 };
+
+// ---------------------------------------------------------------------------
+// Scala
+// ---------------------------------------------------------------------------
+
+export const scalaClassConfig: ClassExtractionConfig = {
+  language: SupportedLanguages.Scala,
+  typeDeclarationNodes: [
+    'class_definition',
+    'trait_definition',
+    'object_definition',
+    'enum_definition',
+  ],
+  fileScopeNodeTypes: ['package_clause'],
+  ancestorScopeNodeTypes: [
+    'class_definition',
+    'trait_definition',
+    'object_definition',
+    'enum_definition',
+  ],
+  extractType(node) {
+    if (node.type === 'trait_definition') return 'Interface';
+    if (node.type === 'enum_definition') return 'Enum';
+    return 'Class';
+  },
+};

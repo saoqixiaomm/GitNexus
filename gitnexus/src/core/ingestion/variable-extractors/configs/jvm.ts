@@ -151,3 +151,50 @@ export const kotlinVariableConfig: VariableExtractionConfig = {
     return false;
   },
 };
+
+function scalaVarNames(node: SyntaxNode): string[] {
+  const names: string[] = [];
+  for (const child of node.namedChildren) {
+    if (child.type === 'identifier' && child.text !== '_') names.push(child.text);
+  }
+  return names;
+}
+
+export const scalaVariableConfig: VariableExtractionConfig = {
+  language: SupportedLanguages.Scala,
+  constNodeTypes: ['val_definition'],
+  staticNodeTypes: [],
+  variableNodeTypes: ['val_definition', 'var_definition'],
+
+  extractName(node) {
+    return scalaVarNames(node)[0];
+  },
+
+  extractNames: scalaVarNames,
+
+  extractType(node) {
+    const typeNode = node.namedChildren.find(
+      (c: SyntaxNode) => c.type === 'type_identifier' || c.type === 'generic_type',
+    );
+    if (typeNode) return extractSimpleTypeName(typeNode) ?? typeNode.text?.trim();
+    return undefined;
+  },
+
+  extractVisibility(node): VariableVisibility {
+    if (hasModifier(node, 'modifiers', 'private')) return 'private';
+    if (hasModifier(node, 'modifiers', 'protected')) return 'protected';
+    return 'public';
+  },
+
+  isConst(node) {
+    return node.type === 'val_definition';
+  },
+
+  isStatic(_node) {
+    return false;
+  },
+
+  isMutable(node) {
+    return node.type === 'var_definition';
+  },
+};

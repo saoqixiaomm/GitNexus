@@ -57,3 +57,8 @@ export const kotlinCallConfig: CallExtractionConfig = {
   language: SupportedLanguages.Kotlin,
   typeAsReceiverHeuristic: true,
 };
+
+export const scalaCallConfig: CallExtractionConfig = {
+  language: SupportedLanguages.Scala,
+  typeAsReceiverHeuristic: true,
+};
