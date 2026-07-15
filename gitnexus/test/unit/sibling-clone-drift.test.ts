@@ -358,4 +358,38 @@ describe('checkCwdMatch', () => {
       await sibling.cleanup();
     }
   });
+
+  it('prefers a registered sibling index that already matches cwd HEAD', async () => {
+    const staleIndex = await createTempDir('cwd-best-stale-');
+    const freshIndex = await createTempDir('cwd-best-fresh-');
+    const sibling = await createTempDir('cwd-best-sibling-');
+    try {
+      const remote = 'https://example.com/foo/bar';
+      const siblingHead = initRepoWithCommit(sibling.dbPath, remote);
+      const now = new Date().toISOString();
+
+      await registerRepo(staleIndex.dbPath, {
+        repoPath: staleIndex.dbPath,
+        lastCommit: 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef',
+        indexedAt: now,
+        remoteUrl: remote,
+      });
+      await registerRepo(freshIndex.dbPath, {
+        repoPath: freshIndex.dbPath,
+        lastCommit: siblingHead,
+        indexedAt: now,
+        remoteUrl: remote,
+      });
+
+      const m = await checkCwdMatch(sibling.dbPath);
+      expect(m.match).toBe('sibling-by-remote');
+      expect(m.entry?.path).toBe(path.resolve(freshIndex.dbPath));
+      expect(m.cwdHead).toBe(siblingHead);
+      expect(m.hint).toBeUndefined();
+    } finally {
+      await staleIndex.cleanup();
+      await freshIndex.cleanup();
+      await sibling.cleanup();
+    }
+  });
 });

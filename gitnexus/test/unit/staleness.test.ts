@@ -100,6 +100,7 @@ describe('checkStalenessAsync', () => {
     const result = await checkStalenessAsync(process.cwd(), previousCommit);
     expect(result.isStale).toBe(true);
     expect(result.commitsBehind).toBeGreaterThan(0);
+    expect(result.currentCommit).toBeTruthy();
     expect(result.hint).toContain('behind HEAD');
   });
 

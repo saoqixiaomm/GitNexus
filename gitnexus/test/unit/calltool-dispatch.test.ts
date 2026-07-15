@@ -117,6 +117,7 @@ import {
   loadMeta,
 } from '../../src/storage/repo-manager.js';
 import { getGitRoot } from '../../src/storage/git.js';
+import { checkStalenessAsync } from '../../src/core/git-staleness.js';
 import { _captureLogger } from '../../src/core/logger.js';
 import {
   initLbug,
@@ -2487,6 +2488,29 @@ describe('LocalBackend repo-id collisions (#2054)', () => {
     // Re-running list_repos (which re-reads the registry) is idempotent.
     const again = await backend.listRepos();
     expect(again).toHaveLength(4);
+  });
+
+  it('points stale local listings at a sibling index that already matches HEAD', async () => {
+    const { dirs, entries } = makeSiblingClonesFixture(2);
+    const currentHead = 'f'.repeat(40);
+    const staleEntry = { ...entries[0], lastCommit: 'a'.repeat(40) };
+    const freshEntry = { ...entries[1], lastCommit: currentHead };
+    (listRegisteredRepos as any).mockResolvedValue([staleEntry, freshEntry]);
+    (checkStalenessAsync as any)
+      .mockResolvedValueOnce({
+        isStale: true,
+        commitsBehind: 2,
+        currentCommit: currentHead,
+        hint: 'old stale hint',
+      })
+      .mockResolvedValueOnce({ isStale: false, commitsBehind: 0 });
+
+    const listed = await backend.listRepos();
+    const stale = listed.find((r) => path.resolve(r.path) === path.resolve(dirs[0]));
+
+    expect(stale?.staleness?.reusableSibling?.path).toBe(freshEntry.path);
+    expect(stale?.staleness?.hint).toContain('already matches HEAD');
+    expect(stale?.staleness?.hint).toContain(freshEntry.path);
   });
 
   it('assigns distinct, resolvable generated ids past the first legacy collision (#2054)', async () => {

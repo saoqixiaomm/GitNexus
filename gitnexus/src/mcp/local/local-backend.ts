@@ -526,7 +526,12 @@ export interface RepoListing {
   lastCommit: string;
   remoteUrl?: string;
   stats?: any;
-  staleness?: { commitsBehind: number; hint?: string };
+  staleness?: {
+    commitsBehind: number;
+    currentCommit?: string;
+    hint?: string;
+    reusableSibling?: { name: string; path: string; lastCommit: string; indexedAt: string };
+  };
   siblings?: Array<{ name: string; path: string; lastCommit: string }>;
   /** Primary/flat branch name, when known (#2106). */
   branch?: string;
@@ -1349,6 +1354,32 @@ export class LocalBackend {
       const siblings = h.remoteUrl
         ? (byRemote.get(h.remoteUrl) ?? []).filter((e) => norm(e.repoPath) !== selfNorm)
         : [];
+      const reusableSibling = stale.currentCommit
+        ? siblings.find((s) => s.lastCommit === stale.currentCommit)
+        : undefined;
+      const staleness = stale.isStale
+        ? {
+            commitsBehind: stale.commitsBehind,
+            currentCommit: stale.currentCommit,
+            hint: reusableSibling
+              ? `⚠️ Index is ${stale.commitsBehind} commit${
+                  stale.commitsBehind > 1 ? 's' : ''
+                } behind this repo's HEAD, but sibling index "${reusableSibling.name}" at ${
+                  reusableSibling.repoPath
+                } already matches HEAD. Use that repo/path for local queries, or run \`gitnexus analyze\` here to refresh this worktree's own index.`
+              : stale.hint,
+            ...(reusableSibling
+              ? {
+                  reusableSibling: {
+                    name: reusableSibling.name,
+                    path: reusableSibling.repoPath,
+                    lastCommit: reusableSibling.lastCommit,
+                    indexedAt: reusableSibling.indexedAt,
+                  },
+                }
+              : {}),
+          }
+        : undefined;
       return {
         name: h.name,
         path: h.repoPath,
@@ -1356,9 +1387,7 @@ export class LocalBackend {
         lastCommit: h.lastCommit,
         remoteUrl: h.remoteUrl,
         stats: h.stats,
-        staleness: stale.isStale
-          ? { commitsBehind: stale.commitsBehind, hint: stale.hint }
-          : undefined,
+        staleness,
         siblings:
           siblings.length > 0
             ? siblings.map((s) => ({

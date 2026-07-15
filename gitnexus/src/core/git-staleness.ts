@@ -14,6 +14,8 @@ const execFileAsync = promisify(execFile);
 export interface StalenessInfo {
   isStale: boolean;
   commitsBehind: number;
+  /** Current HEAD of repoPath, when resolved. Present on stale results. */
+  currentCommit?: string;
   hint?: string;
 }
 
@@ -32,10 +34,14 @@ export function checkStaleness(repoPath: string, lastCommit: string): StalenessI
     const commitsBehind = parseInt(result, 10) || 0;
 
     if (commitsBehind > 0) {
+      const currentCommit = getCurrentCommit(repoPath) || undefined;
       return {
         isStale: true,
         commitsBehind,
-        hint: `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. Run analyze tool to update.`,
+        currentCommit,
+        hint:
+          `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. ` +
+          'Run `gitnexus analyze` in this repo to refresh it.',
       };
     }
 
@@ -66,10 +72,14 @@ export async function checkStalenessAsync(
     const commitsBehind = parseInt(stdout.trim(), 10) || 0;
 
     if (commitsBehind > 0) {
+      const currentCommit = getCurrentCommit(repoPath) || undefined;
       return {
         isStale: true,
         commitsBehind,
-        hint: `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. Run analyze tool to update.`,
+        currentCommit,
+        hint:
+          `⚠️ Index is ${commitsBehind} commit${commitsBehind > 1 ? 's' : ''} behind HEAD. ` +
+          'Run `gitnexus analyze` in this repo to refresh it.',
       };
     }
 
@@ -78,6 +88,39 @@ export async function checkStalenessAsync(
     return { isStale: false, commitsBehind: 0 };
   }
 }
+
+const indexedAtMs = (entry: RegistryEntry): number => {
+  const ms = Date.parse(entry.indexedAt);
+  return Number.isFinite(ms) ? ms : 0;
+};
+
+const chooseBestSiblingIndex = (
+  siblings: RegistryEntry[],
+  cwdGitRoot: string,
+  cwdHead: string | undefined,
+): { entry: RegistryEntry; drift?: number } | undefined => {
+  if (siblings.length === 0) return undefined;
+  const ranked = siblings.map((entry) => ({
+    entry,
+    drift: commitsAheadOfIndexed(cwdGitRoot, entry.lastCommit),
+  }));
+
+  if (cwdHead) {
+    const exact = ranked.find((candidate) => candidate.entry.lastCommit === cwdHead);
+    if (exact) return exact;
+  }
+
+  const withKnownDrift = ranked.filter((candidate) => candidate.drift !== undefined);
+  if (withKnownDrift.length > 0) {
+    return withKnownDrift.sort((a, b) => {
+      const byDrift = (a.drift ?? Number.MAX_SAFE_INTEGER) - (b.drift ?? Number.MAX_SAFE_INTEGER);
+      if (byDrift !== 0) return byDrift;
+      return indexedAtMs(b.entry) - indexedAtMs(a.entry);
+    })[0];
+  }
+
+  return ranked.sort((a, b) => indexedAtMs(b.entry) - indexedAtMs(a.entry))[0];
+};
 
 /**
  * Compare a sibling-clone HEAD against an indexed `lastCommit`. Returns
@@ -149,13 +192,13 @@ export async function checkCwdMatch(cwd: string): Promise<CwdMatch> {
   const cwdRemote = getRemoteUrl(cwdGitRoot);
   if (!cwdRemote) return { match: 'none' };
 
-  const sibling = entries.find(
+  const siblings = entries.filter(
     (e) => e.remoteUrl === cwdRemote && norm(e.path) !== norm(cwdGitRoot),
   );
-  if (!sibling) return { match: 'none' };
-
   const cwdHead = getCurrentCommit(cwdGitRoot) || undefined;
-  const drift = commitsAheadOfIndexed(cwdGitRoot, sibling.lastCommit);
+  const best = chooseBestSiblingIndex(siblings, cwdGitRoot, cwdHead);
+  if (!best) return { match: 'none' };
+  const { entry: sibling, drift } = best;
 
   // Same commit on both clones → still report match=sibling-by-remote
   // (the relationship is real and useful to callers like list_repos /
