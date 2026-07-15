@@ -643,7 +643,7 @@ export async function runChunkedParseAndResolve(
   // there is no storage path (tests / direct pipeline calls), we fall back to
   // retaining them in `allParsedFiles` (small-repo path, preserves prior
   // behavior). Cleared up-front so a prior run's shards never leak in.
-  const parsedFileStorePath = parseCache?.storagePath;
+  const parsedFileStorePath = parseCache?.parsedFileStorePath ?? parseCache?.storagePath;
   if (parsedFileStorePath) await clearParsedFileStore(parsedFileStorePath);
   // Durable, content-addressed ParsedFile store (#2038 warm-cache coverage) —
   // a sibling of the run-scoped store, NOT cleared per run. Workers write a
@@ -653,7 +653,9 @@ export async function runChunkedParseAndResolve(
   // PARSE_CACHE_VERSION (a mismatch ⇒ empty ⇒ every chunk re-dispatches, which
   // repopulates the durable store — never the main-thread extract fallback).
   const durableParsedFileDir =
-    parsedFileStorePath !== undefined ? getDurableParsedFileDir(parsedFileStorePath) : undefined;
+    parseCache?.storagePath !== undefined
+      ? getDurableParsedFileDir(parseCache.storagePath)
+      : undefined;
   const durableHitKeys =
     durableParsedFileDir !== undefined
       ? await loadDurableParsedFileIndex(durableParsedFileDir, PARSE_CACHE_VERSION)

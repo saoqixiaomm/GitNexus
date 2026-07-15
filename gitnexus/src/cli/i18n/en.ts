@@ -216,6 +216,9 @@ export const en = {
   'help.option.clean.all': 'Clean all indexed repos',
   'help.option.clean.branch': 'Delete only the named branch index (not the primary)',
   'help.option.clean.lbugSidecars': 'Clean quarantined LadybugDB missing-shadow WAL sidecars',
+  'help.option.clean.gc': 'Preview or delete stale registered indexes',
+  'help.option.clean.dryRun': 'Preview cleanup without deleting anything',
+  'help.option.clean.olderThanDays': 'Include indexes last written more than this many days ago',
   'help.option.wiki.force': 'Force full regeneration even if up to date',
   'help.option.wiki.provider':
     'LLM provider: openai, openrouter, azure, custom, cursor, claude, codex, or opencode (default: openai)',

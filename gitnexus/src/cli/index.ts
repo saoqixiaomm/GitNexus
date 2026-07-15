@@ -257,6 +257,9 @@ program
   .option('--all', 'Clean all indexed repos')
   .option('--branch <name>', 'Delete only the named branch index (not the primary)')
   .option('--lbug-sidecars', 'Clean quarantined LadybugDB missing-shadow WAL sidecars')
+  .option('--gc', 'Preview or delete stale registered indexes')
+  .option('--dry-run', 'Preview cleanup without deleting anything')
+  .option('--older-than-days <days>', 'Include indexes last written more than this many days ago')
   .action(createLazyAction(() => import('./clean.js'), 'cleanCommand'));
 
 program

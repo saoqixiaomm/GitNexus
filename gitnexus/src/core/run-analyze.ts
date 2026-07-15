@@ -90,6 +90,7 @@ import {
   getInferredRepoName,
   resolveRepoIdentityRoot,
 } from '../storage/git.js';
+import { getSharedCachePaths } from '../storage/shared-cache.js';
 import type { CachedEmbedding } from './embeddings/types.js';
 import { generateAIContextFiles } from '../cli/ai-context.js';
 import { sanitizeDetectedBranch } from '../cli/analyze-config.js';
@@ -239,6 +240,12 @@ export interface AnalyzeOptions {
    * consumer scan unchanged.
    */
   fetchWrappers?: string[];
+  /**
+   * Share parse-cache and durable ParsedFile shards across worktrees/clones of
+   * the same logical git repo. Enabled by default for non-test git repos; set
+   * false or GITNEXUS_SHARED_PARSE_CACHE=0 for production diagnostics.
+   */
+  sharedParseCache?: boolean;
   /**
    * The caller will `process.exit()` immediately after this analyze returns (the
    * CLI `analyze` command). When set, the finalize/error close CHECKPOINTs for
@@ -543,6 +550,20 @@ export const pdgModeMismatch = (recorded: RepoMeta['pdg'], options: PdgOptions):
   return false;
 };
 
+const sharedParseCacheEnv = (): boolean | undefined => {
+  const value = process.env.GITNEXUS_SHARED_PARSE_CACHE?.trim().toLowerCase();
+  if (value === '1' || value === 'true' || value === 'yes') return true;
+  if (value === '0' || value === 'false' || value === 'no') return false;
+  return undefined;
+};
+
+const sharedParseCacheEnabled = (option: boolean | undefined): boolean => {
+  if (option !== undefined) return option;
+  const env = sharedParseCacheEnv();
+  if (env !== undefined) return env;
+  return process.env.NODE_ENV !== 'test';
+};
+
 export async function runFullAnalysis(
   repoPath: string,
   options: AnalyzeOptions,
@@ -573,6 +594,12 @@ export async function runFullAnalysis(
 
   const repoHasGit = hasGitDir(repoPath);
   const currentCommit = repoHasGit ? getCurrentCommit(repoPath) : '';
+  const remoteUrl = repoHasGit ? getRemoteUrl(repoPath) : undefined;
+  const sharedCache =
+    repoHasGit && sharedParseCacheEnabled(options.sharedParseCache)
+      ? getSharedCachePaths(repoPath, remoteUrl)
+      : null;
+  const parseCacheStoragePath = sharedCache?.parseCachePath ?? storagePath;
 
   // ── #2106: resolve which branch slot this run writes to ───────────────
   // `branchLabel` is the branch identity recorded in meta.json (incl. the
@@ -927,7 +954,11 @@ export async function runFullAnalysis(
   // file contents haven't changed produce identical worker output).
   // Loaded into a single ParseCache object that the pipeline mutates
   // in-place (cache hits leave entries unchanged; misses add new ones).
-  const parseCache = await loadParseCache(storagePath);
+  const parseCache = await loadParseCache(parseCacheStoragePath);
+  if (sharedCache) {
+    parseCache.parsedFileStorePath = storagePath;
+    log(`Parse cache: shared repo cache ${sharedCache.repoId}`);
+  }
 
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
   const pipelineResult = await runPipelineFromRepo(
@@ -1445,7 +1476,7 @@ export async function runFullAnalysis(
       // a second git shellout. `undefined` when the repo has no
       // origin remote, which is fine: paths-only repos behave as
       // before.
-      remoteUrl: hasGitDir(repoPath) ? getRemoteUrl(repoPath) : undefined,
+      remoteUrl,
       stats: {
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,
@@ -1516,11 +1547,19 @@ export async function runFullAnalysis(
         log('Parse cache: a branch meta was unreadable — retaining all cached chunks (#2106).');
         for (const k of parseCache.entries.keys()) parseCache.usedKeys.add(k);
       }
+      if (sharedCache?.parseCachePath === parseCacheStoragePath) {
+        // Cross-worktree shared caches cannot know every live branch/version from
+        // this one worktree's meta files. Retain existing global shards here;
+        // explicit cache GC can reclaim old repo-level caches later.
+        for (const k of parseCache.onDiskKeys ?? []) parseCache.usedKeys.add(k);
+      }
       const pruned = pruneCache(parseCache, parseCache.usedKeys);
       if (pruned > 0) {
         log(`Parse cache: pruned ${pruned} stale chunk entries`);
       }
-      const savedKeys = await saveParseCache(storagePath, parseCache);
+      const savedKeys = await saveParseCache(parseCacheStoragePath, parseCache, {
+        preserveExistingShards: sharedCache !== null,
+      });
       // Prune the durable ParsedFile store to EXACTLY the parse cache's
       // surviving keys (#2038 warm-cache coverage), so the two content-addressed
       // stores stay coherent: a chunk is "cached" iff both its parse-cache shard
@@ -1529,7 +1568,7 @@ export async function runFullAnalysis(
       // next run. Same try/catch — a durable-store write failure must never
       // break an otherwise successful run (next run treats it as a miss).
       await pruneAndSaveDurableParsedFileStore(
-        getDurableParsedFileDir(storagePath),
+        getDurableParsedFileDir(parseCacheStoragePath),
         PARSE_CACHE_VERSION,
         new Set(savedKeys),
       );

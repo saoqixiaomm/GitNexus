@@ -103,6 +103,16 @@ interface ShardedParseCacheIndex {
   keys: string[];
 }
 
+export interface SaveParseCacheOptions {
+  /**
+   * Keep existing shard files in place and only refresh the shard index.
+   * Used by cross-worktree shared caches where pruning from one worktree's
+   * branch metadata would evict other live worktree/version shards and where
+   * copying the whole cache tree on every run would dominate save time.
+   */
+  preserveExistingShards?: boolean;
+}
+
 /** Runtime view: keyed Map for fast lookup; mutated in place during a run. */
 export interface ParseCache {
   version: string;
@@ -123,6 +133,13 @@ export interface ParseCache {
   storagePath?: string;
   /** Index of chunk hashes known to exist under `storagePath/parse-cache/`. */
   onDiskKeys?: Set<string>;
+  /**
+   * Run-scoped ParsedFile store root. Defaults to `storagePath` for legacy
+   * callers. Analyze can point durable parse-cache shards at a shared global
+   * cache while keeping this transient store under the current worktree, so
+   * concurrent worktree analyses never clear each other's run-local shards.
+   */
+  parsedFileStorePath?: string;
 }
 
 /** SHA-256 hex of a single string or buffer. */
@@ -409,10 +426,53 @@ export const loadParseCache = async (storagePath: string): Promise<ParseCache> =
  * reparses. This is not a single atomic swap of the whole tree, but avoids
  * leaving a half-written shard set visible to readers.
  */
-export const saveParseCache = async (storagePath: string, cache: ParseCache): Promise<string[]> => {
+export const saveParseCache = async (
+  storagePath: string,
+  cache: ParseCache,
+  options?: SaveParseCacheOptions,
+): Promise<string[]> => {
   await fs.mkdir(storagePath, { recursive: true });
   const cacheDir = getCacheDirPath(storagePath);
-  const tmpDir = `${cacheDir}.tmp`;
+  if (options?.preserveExistingShards) {
+    await fs.mkdir(cacheDir, { recursive: true });
+    const keys = [...cache.usedKeys].filter(isValidChunkCacheKey).sort();
+    const writtenKeys: string[] = [];
+    for (const chunkHash of keys) {
+      const inMemory = cache.entries.get(chunkHash);
+      if (inMemory !== undefined) {
+        let payload: string;
+        try {
+          payload = JSON.stringify(inMemory, mapReplacer);
+        } catch {
+          continue;
+        }
+        await fs.writeFile(getCacheChunkPath(storagePath, chunkHash), payload, 'utf-8');
+      }
+      try {
+        await fs.access(getCacheChunkPath(storagePath, chunkHash));
+        writtenKeys.push(chunkHash);
+      } catch {
+        /* shard missing — skip; next run treats as cache miss */
+      }
+    }
+
+    const index: ShardedParseCacheIndex = {
+      version: cache.version,
+      keys: writtenKeys,
+    };
+    const indexPath = getCacheIndexPath(storagePath);
+    const tmpIndexPath = `${indexPath}.tmp-${process.pid}-${Date.now()}-${Math.random()
+      .toString(16)
+      .slice(2)}`;
+    await fs.writeFile(tmpIndexPath, JSON.stringify(index), 'utf-8');
+    await fs.rename(tmpIndexPath, indexPath);
+    await fs.rm(getLegacyCachePath(storagePath), { force: true });
+    return writtenKeys;
+  }
+
+  const tmpDir = `${cacheDir}.tmp-${process.pid}-${Date.now()}-${Math.random()
+    .toString(16)
+    .slice(2)}`;
   await fs.rm(tmpDir, { recursive: true, force: true });
   await fs.mkdir(tmpDir, { recursive: true });
 

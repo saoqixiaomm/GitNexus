@@ -205,6 +205,9 @@ export const zhCN = {
   'help.option.clean.all': '清理所有已索引仓库',
   'help.option.clean.branch': '仅删除指定分支的索引（不影响主索引）',
   'help.option.clean.lbugSidecars': '清理已隔离的 LadybugDB missing-shadow WAL sidecar',
+  'help.option.clean.gc': '预览或删除过期的已注册索引',
+  'help.option.clean.dryRun': '仅预览清理内容，不删除任何文件',
+  'help.option.clean.olderThanDays': '包含最后写入时间超过指定天数的索引',
   'help.option.wiki.force': '即使已是最新也强制完整重新生成',
   'help.option.wiki.provider':
     'LLM 提供商：openai、openrouter、azure、custom、cursor、claude、codex 或 opencode（默认：openai）',

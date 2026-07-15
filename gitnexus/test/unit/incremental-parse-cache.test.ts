@@ -170,6 +170,46 @@ describe('loadParseCache / saveParseCache (round-trip)', () => {
     }
   });
 
+  it('can refresh the shard index without deleting existing shard files', async () => {
+    const dir = await mkdtemp(path.join(tmpdir(), 'gnx-pc-'));
+    try {
+      const fs = await import('fs/promises');
+      const cacheDir = path.join(dir, 'parse-cache');
+      const keptKey = 'a'.repeat(64);
+      const unindexedKey = 'b'.repeat(64);
+      const newKey = 'c'.repeat(64);
+      await fs.mkdir(cacheDir, { recursive: true });
+      await fs.writeFile(
+        path.join(cacheDir, `${keptKey}.json`),
+        JSON.stringify([minimalResult({ fileCount: 1 })]),
+        'utf-8',
+      );
+      await fs.writeFile(
+        path.join(cacheDir, `${unindexedKey}.json`),
+        JSON.stringify([minimalResult({ fileCount: 9 })]),
+        'utf-8',
+      );
+
+      const cache: ParseCache = {
+        version: PARSE_CACHE_VERSION,
+        entries: new Map([[newKey, [minimalResult({ fileCount: 2 })]]]),
+        usedKeys: new Set([keptKey, newKey]),
+        storagePath: dir,
+        onDiskKeys: new Set([keptKey, unindexedKey]),
+      };
+
+      const saved = await saveParseCache(dir, cache, { preserveExistingShards: true });
+
+      expect(saved).toEqual([keptKey, newKey].sort());
+      await expect(fs.access(path.join(cacheDir, `${unindexedKey}.json`))).resolves.toBeUndefined();
+      const loaded = await loadParseCache(dir);
+      expect([...(loaded.onDiskKeys ?? [])].sort()).toEqual([keptKey, newKey].sort());
+      expect(await loadParseCacheChunk(loaded, newKey)).toEqual([minimalResult({ fileCount: 2 })]);
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
+  });
+
   it('returns an empty cache when the file is missing', async () => {
     const dir = await mkdtemp(path.join(tmpdir(), 'gnx-pc-'));
     try {
