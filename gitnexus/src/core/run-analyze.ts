@@ -153,6 +153,12 @@ export interface AnalyzeOptions {
    * scope-resolution (BasicBlock/CFG emit gate). Off by default.
    */
   pdg?: boolean;
+  /**
+   * Fast index mode. Skips the expensive graph-analysis phases that generate
+   * MRO, communities, and processes. The persisted graph still includes the
+   * core symbols and relationships emitted by parse/scope-resolution.
+   */
+  fast?: boolean;
   /** Per-function source-line cap for worker-side CFG construction (#2081 M1).
    *  Forwarded to `PipelineOptions.pdgMaxFunctionLines`. No CLI flag in M1 —
    *  programmatic / server analyze-worker path only; the worker applies
@@ -961,6 +967,12 @@ export async function runFullAnalysis(
   }
 
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
+  if (options.fast === true) {
+    log(
+      'Fast analyze: skipping MRO, community detection, and process extraction ' +
+        '(clusters/flows will be 0).',
+    );
+  }
   const pipelineResult = await runPipelineFromRepo(
     repoPath,
     (p) => {
@@ -991,6 +1003,7 @@ export async function runFullAnalysis(
       // offloaded BasicBlock layer. Memory-only; byte-identical output.
       streamPdgEmit: resolveStreamPdgEmit(options),
       pdgEmitChunkSize: resolvePdgEmitChunkSize(options),
+      skipGraphPhases: options.fast === true,
       fetchWrappers: options.fetchWrappers,
     },
   );
@@ -1481,8 +1494,8 @@ export async function runFullAnalysis(
         files: pipelineResult.totalFileCount,
         nodes: stats.nodes,
         edges: stats.edges,
-        communities: pipelineResult.communityResult?.stats.totalCommunities,
-        processes: pipelineResult.processResult?.stats.totalProcesses,
+        communities: pipelineResult.communityResult?.stats.totalCommunities ?? 0,
+        processes: pipelineResult.processResult?.stats.totalProcesses ?? 0,
         embeddings: embeddingCount,
       },
       capabilities: {

@@ -85,6 +85,11 @@ program
       'for supported languages. Opt-in; off by default. (#2081 M1)',
   )
   .option(
+    '--fast',
+    'Faster rebuild: skip MRO, community detection, and process extraction. ' +
+      'Keeps symbol/call/import indexing but omits clusters and flows.',
+  )
+  .option(
     '--default-branch <branch>',
     'Default branch used in the generated regression-compare example (base_ref). ' +
       'Falls back to .gitnexusrc, then auto-detected origin/HEAD, then "main".',

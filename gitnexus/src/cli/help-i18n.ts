@@ -55,6 +55,7 @@ const OPTION_DESCRIPTION_KEYS = {
   'analyze|--skills': 'help.option.analyze.skills',
   'analyze|--write-context-files': 'help.option.analyze.writeContextFiles',
   'analyze|--skip-agents-md': 'help.option.analyze.skipAgentsMd',
+  'analyze|--fast': 'help.option.analyze.fast',
   'analyze|--no-stats': 'help.option.analyze.noStats',
   'analyze|--skip-skills': 'help.option.analyze.skipSkills',
   'analyze|--index-only': 'help.option.analyze.indexOnly',

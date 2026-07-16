@@ -178,6 +178,8 @@ export const en = {
     'Write project-local AI context files (AGENTS.md, CLAUDE.md, and standard .claude/skills/gitnexus/). Disabled by default.',
   'help.option.analyze.skipAgentsMd':
     'When --write-context-files is set, skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
+  'help.option.analyze.fast':
+    'Faster rebuild: skip MRO, community detection, and process extraction. Keeps symbol/call/import indexing but omits clusters and flows.',
   'help.option.analyze.noStats': 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md',
   'help.option.analyze.skipSkills':
     'When --write-context-files is set, skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/).',

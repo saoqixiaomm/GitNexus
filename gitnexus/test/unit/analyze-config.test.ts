@@ -102,6 +102,17 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
     expect(() => loadAnalyzeConfig(dir)).toThrow(/must be a boolean/);
   });
 
+  it('normalizes fast index mode and rejects a non-boolean value', async () => {
+    await writeRc(JSON.stringify({ fast: true }));
+    expect(loadAnalyzeConfig(dir)).toEqual({ fast: true });
+
+    await writeRc(JSON.stringify({ fast: false }));
+    expect(loadAnalyzeConfig(dir)).toEqual({ fast: false });
+
+    await writeRc(JSON.stringify({ fast: 'yes' }));
+    expect(() => loadAnalyzeConfig(dir)).toThrow(/must be a boolean/);
+  });
+
   it('parses the nested analyze form', async () => {
     await writeRc(JSON.stringify({ analyze: { defaultBranch: 'master', skipSkills: true } }));
     expect(loadAnalyzeConfig(dir)).toEqual({ defaultBranch: 'master', skipSkills: true });
@@ -264,6 +275,11 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
   it('mergeAnalyzeOptions: CLI value wins over config', () => {
     const merged = mergeAnalyzeOptions({ workerTimeout: '5' }, { workerTimeout: '60' });
     expect(merged.workerTimeout).toBe('5');
+  });
+
+  it('mergeAnalyzeOptions: CLI fast value wins over config', () => {
+    expect(mergeAnalyzeOptions({ fast: true }, { fast: false }).fast).toBe(true);
+    expect(mergeAnalyzeOptions({ fast: false }, { fast: true }).fast).toBe(false);
   });
 
   it('mergeAnalyzeOptions: an explicit CLI false overrides a config true', () => {

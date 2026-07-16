@@ -45,6 +45,7 @@ describe('--skip-git CLI flag', () => {
     expect(helpOutput).toContain('--skip-agents-md');
     expect(helpOutput).toContain('--skip-skills');
     expect(helpOutput).toContain('--index-only');
+    expect(helpOutput).toContain('--fast');
     expect(helpOutput).not.toContain('--no-git');
   });
 

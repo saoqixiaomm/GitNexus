@@ -169,6 +169,8 @@ export const zhCN = {
     '写入项目本地 AI 上下文文件（AGENTS.md、CLAUDE.md 和标准 .claude/skills/gitnexus/）。默认关闭。',
   'help.option.analyze.skipAgentsMd':
     '设置 --write-context-files 时，跳过更新 AGENTS.md 和 CLAUDE.md 中的 gitnexus 区块',
+  'help.option.analyze.fast':
+    '更快重建：跳过 MRO、社区检测和流程提取。保留符号/调用/导入索引，但不生成 clusters 和 flows。',
   'help.option.analyze.noStats': '从 AGENTS.md 和 CLAUDE.md 中省略易变的文件/符号计数',
   'help.option.analyze.skipSkills':
     '设置 --write-context-files 时，跳过安装 .claude/skills/gitnexus/ 下的标准 GitNexus skill 文件。不抑制 --skills 生成的社区 skill（位于 .claude/skills/generated/）。',

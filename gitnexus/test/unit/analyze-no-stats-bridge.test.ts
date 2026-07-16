@@ -128,6 +128,15 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.repairFts).toBe(true);
   });
 
+  it('passes --fast through to runFullAnalysis', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { fast: true });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.fast).toBe(true);
+  });
+
   it('rejects combining --repair-fts with --force', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

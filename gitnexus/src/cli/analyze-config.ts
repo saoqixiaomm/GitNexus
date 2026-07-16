@@ -90,6 +90,7 @@ const KEY_SPECS: Record<string, KeySpec> = {
   skipAiContext: { target: 'skipAgentsMd', kind: 'boolean' },
   skipSkills: { target: 'skipSkills', kind: 'boolean' },
   pdg: { target: 'pdg', kind: 'boolean' },
+  fast: { target: 'fast', kind: 'boolean' },
   indexOnly: { target: 'indexOnly', kind: 'boolean' },
   stats: { target: 'stats', kind: 'boolean' },
   noStats: { target: 'stats', kind: 'boolean-negate' },

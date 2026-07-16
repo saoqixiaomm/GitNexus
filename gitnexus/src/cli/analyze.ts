@@ -618,6 +618,12 @@ export interface AnalyzeOptions {
    */
   pdg?: boolean;
   /**
+   * Fast index mode: keep symbol/call/import indexing but skip graph-analysis
+   * phases (MRO, communities, processes). Useful when rebuilding large repos for
+   * local navigation and impact checks where flow/cluster output is not needed.
+   */
+  fast?: boolean;
+  /**
    * Stats inclusion in AGENTS.md and CLAUDE.md.
    *
    * Commander.js represents `--no-stats` as `stats: boolean` (default
@@ -1279,6 +1285,7 @@ const analyzeCommandImpl = async (
         skipSkills,
         // CFG/PDG substrate opt-in (#2081 M1) — threaded to both sinks downstream.
         pdg: options.pdg === true,
+        fast: options.fast === true,
         // Resolved default branch (CLI > .gitnexusrc > auto-detect > "main")
         // threaded into the generated regression-compare example (#243).
         defaultBranch: resolvedDefaultBranch,
