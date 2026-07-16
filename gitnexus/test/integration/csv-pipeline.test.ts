@@ -166,6 +166,38 @@ describe('streamAllCSVsToDisk', () => {
     expect(content).toContain('"index.ts"');
   });
 
+  it('can omit persisted source content for lean fast indexes', async () => {
+    const graph = buildTestGraph([
+      {
+        id: 'file:src/index.ts',
+        label: 'File',
+        name: 'index.ts',
+        filePath: 'src/index.ts',
+      },
+      {
+        id: 'func:main',
+        label: 'Function',
+        name: 'main',
+        filePath: 'src/index.ts',
+        startLine: 1,
+        endLine: 4,
+        isExported: true,
+      },
+    ]);
+
+    const result = await streamAllCSVsToDisk(graph, repoDir, csvDir, undefined, {
+      includeContent: false,
+    });
+
+    const fileContent = await fs.readFile(result.nodeFiles.get('File')!.csvPath, 'utf-8');
+    const functionContent = await fs.readFile(result.nodeFiles.get('Function')!.csvPath, 'utf-8');
+
+    expect(fileContent).toContain('"file:src/index.ts","index.ts","src/index.ts",""');
+    expect(functionContent).toContain('"func:main","main","src/index.ts",1,4,true,"",""');
+    expect(fileContent).not.toContain('console.log');
+    expect(functionContent).not.toContain('console.log');
+  });
+
   it('handles community nodes with keywords', async () => {
     const graph = buildTestGraph([
       {

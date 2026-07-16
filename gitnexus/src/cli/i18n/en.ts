@@ -179,7 +179,7 @@ export const en = {
   'help.option.analyze.skipAgentsMd':
     'When --write-context-files is set, skip updating the gitnexus section in AGENTS.md and CLAUDE.md',
   'help.option.analyze.fast':
-    'Faster rebuild: skip MRO, community detection, and process extraction. Keeps symbol/call/import indexing but omits clusters and flows.',
+    'Lean structural rebuild: keep files/symbols/routes where available but skip scope resolution, precise calls/imports, MRO, clusters, flows, source snippets, and FTS.',
   'help.option.analyze.noStats': 'Omit volatile file/symbol counts from AGENTS.md and CLAUDE.md',
   'help.option.analyze.skipSkills':
     'When --write-context-files is set, skip installing standard GitNexus skill files under .claude/skills/gitnexus/. Does not suppress community skills from --skills (those use .claude/skills/generated/).',

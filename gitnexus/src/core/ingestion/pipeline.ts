@@ -53,6 +53,14 @@ export interface PipelineOptions {
    */
   skipGraphPhases?: boolean;
   /**
+   * Skip registry-primary scope resolution and the prune pass that depends on
+   * it. This is stricter than `skipGraphPhases`: it trades precise resolved
+   * IMPORTS/CALLS/INHERITS edges for a much faster structural/symbol index.
+   * Intended for CLI `--fast`; resolver tests keep using `skipGraphPhases`
+   * because they explicitly exercise scope-resolution behavior.
+   */
+  skipResolutionPhases?: boolean;
+  /**
    * Build the control-flow-graph / PDG substrate (#2081 M1, opt-in via `--pdg`).
    * Off by default: workers skip all CFG work and emit no `cfgSideChannel`, and
    * scope-resolution emits no BasicBlock nodes or CFG edges — so the default
@@ -267,16 +275,26 @@ export function buildPhaseList(options?: PipelineOptions): PipelinePhase[] {
       .register(toolsPhase)
       .register(ormPhase)
       .register(crossFilePhase)
-      .register(scopeResolutionPhase)
-      .register(pruneLocalSymbolsPhase)
+      .register(scopeResolutionPhase, { enabledWhen: (o) => !o.skipResolutionPhases })
+      .register(pruneLocalSymbolsPhase, { enabledWhen: (o) => !o.skipResolutionPhases })
       // M4 (#2084): interprocedural taint fixpoint — the first real opt-in
       // pdg-gated phase. Off ⇒ absent ⇒ byte-identical graph. No always-on
       // phase depends on it (a filtered-out dep would throw in getPhaseOutput).
-      .register(taintSummariesPhase, { enabledWhen: (o) => o.pdg === true })
-      .register(callSummariesPhase, { enabledWhen: (o) => o.pdg === true })
-      .register(mroPhase, { enabledWhen: (o) => !o.skipGraphPhases })
-      .register(communitiesPhase, { enabledWhen: (o) => !o.skipGraphPhases })
-      .register(processesPhase, { enabledWhen: (o) => !o.skipGraphPhases })
+      .register(taintSummariesPhase, {
+        enabledWhen: (o) => o.pdg === true && !o.skipResolutionPhases,
+      })
+      .register(callSummariesPhase, {
+        enabledWhen: (o) => o.pdg === true && !o.skipResolutionPhases,
+      })
+      .register(mroPhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && !o.skipResolutionPhases,
+      })
+      .register(communitiesPhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && !o.skipResolutionPhases,
+      })
+      .register(processesPhase, {
+        enabledWhen: (o) => !o.skipGraphPhases && !o.skipResolutionPhases,
+      })
       // Normalize a missing options object once here so phase predicates above
       // take a required PipelineOptions and need no `?.` guard (#2080 review S1).
       .build(options ?? {})
@@ -311,12 +329,16 @@ export const runPipelineFromRepo = async (
 
   let communityResult: CommunitiesOutput['communityResult'] | undefined;
   let processResult: ProcessesOutput['processResult'] | undefined;
-  const scopeResolutionOutput = getPhaseOutput<ScopeResolutionOutput>(results, 'scopeResolution');
-  const resolutionOutcomes = scopeResolutionOutput.resolutionOutcomes;
-  // Streamed PDG-emit manifest (#2202): present only when streaming was on.
-  const pdgEmitManifest = scopeResolutionOutput.pdgEmitManifest;
+  let resolutionOutcomes: ScopeResolutionOutput['resolutionOutcomes'] = [];
+  let pdgEmitManifest: ScopeResolutionOutput['pdgEmitManifest'];
+  if (!options?.skipResolutionPhases) {
+    const scopeResolutionOutput = getPhaseOutput<ScopeResolutionOutput>(results, 'scopeResolution');
+    resolutionOutcomes = scopeResolutionOutput.resolutionOutcomes;
+    // Streamed PDG-emit manifest (#2202): present only when streaming was on.
+    pdgEmitManifest = scopeResolutionOutput.pdgEmitManifest;
+  }
 
-  if (!options?.skipGraphPhases) {
+  if (!options?.skipGraphPhases && !options?.skipResolutionPhases) {
     communityResult = getPhaseOutput<CommunitiesOutput>(results, 'communities').communityResult;
     processResult = getPhaseOutput<ProcessesOutput>(results, 'processes').processResult;
   }

@@ -1514,11 +1514,19 @@ const analyzeCommandImpl = async (
     // progress-bar log() that fired mid-run has already scrolled away, so the
     // degraded-search state must also appear in the final summary (#1161).
     if (result.ftsSkipped) {
-      console.log(
-        `\n  Warning: full-text/BM25 search is disabled — the LadybugDB FTS extension was unavailable.\n` +
-          `  Install it once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) then rerun, or\n` +
-          `  run \`gitnexus analyze --repair-fts\` when connected. Run \`gitnexus doctor\` for details.`,
-      );
+      if (result.ftsSkippedReason === 'fast') {
+        console.log(
+          `\n  Note: --fast produced a lean structural index. Precise CALLS/IMPORTS, clusters,\n` +
+            `  flows, full-text/BM25 search, and persisted source snippets were skipped.\n` +
+            `  Run a full/non-fast analyze when complete impact analysis is needed.`,
+        );
+      } else {
+        console.log(
+          `\n  Warning: full-text/BM25 search is disabled — the LadybugDB FTS extension was unavailable.\n` +
+            `  Install it once with network access (GITNEXUS_LBUG_EXTENSION_INSTALL=auto) then rerun, or\n` +
+            `  run \`gitnexus analyze --repair-fts\` when connected. Run \`gitnexus doctor\` for details.`,
+        );
+      }
     }
 
     try {

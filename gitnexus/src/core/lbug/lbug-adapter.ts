@@ -903,6 +903,15 @@ const doInitLbug = async (dbPath: string, readOnly: boolean = false) => {
 
 export type LbugProgressCallback = (message: string) => void;
 
+export interface LoadGraphToLbugOptions {
+  /**
+   * Persist source snippets into node `content` columns. Defaults to true.
+   * Fast/lean indexes set this false to keep structural graph rows without
+   * paying per-symbol content extraction and large content COPY costs.
+   */
+  includeContent?: boolean;
+}
+
 /**
  * Run a COPY, retrying once with IGNORE_ERRORS=true (which skips row-level
  * errors) on first failure. On a second failure, hand the RAW retry error to
@@ -984,6 +993,7 @@ export const loadGraphToLbug = async (
    * emits none — the manifest is the sole source and there is no double-COPY.
    */
   pdgEmitManifest?: PdgEmitManifest,
+  options?: LoadGraphToLbugOptions,
 ) => {
   if (!conn) {
     throw new Error('LadybugDB not initialized. Call initLbug first.');
@@ -1064,8 +1074,12 @@ export const loadGraphToLbug = async (
   let csvResult: StreamedCSVResult;
   try {
     csvResult = SERIAL
-      ? await streamAllCSVsToDisk(graph, repoPath, csvDir)
-      : await streamAllCSVsToDisk(graph, repoPath, csvDir, beginNodeCopy);
+      ? await streamAllCSVsToDisk(graph, repoPath, csvDir, undefined, {
+          includeContent: options?.includeContent,
+        })
+      : await streamAllCSVsToDisk(graph, repoPath, csvDir, beginNodeCopy, {
+          includeContent: options?.includeContent,
+        });
   } catch (emitErr) {
     // Relationship emit failed. In overlap mode a node COPY may be in flight —
     // settle it (the .catch above means this never rejects) before rethrowing so

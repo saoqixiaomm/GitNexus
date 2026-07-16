@@ -83,6 +83,14 @@ const FULL_ORDER = [
 const WITHOUT_GRAPH_PHASES = FULL_ORDER.filter(
   (n) => n !== 'mro' && n !== 'communities' && n !== 'processes',
 );
+const WITHOUT_RESOLUTION_PHASES = FULL_ORDER.filter(
+  (n) =>
+    n !== 'scopeResolution' &&
+    n !== 'pruneLocalSymbols' &&
+    n !== 'mro' &&
+    n !== 'communities' &&
+    n !== 'processes',
+);
 
 describe('buildPhaseList parity (registry refactor, #2080)', () => {
   it('default options → full phase list in legacy order', () => {
@@ -97,6 +105,12 @@ describe('buildPhaseList parity (registry refactor, #2080)', () => {
   it('skipGraphPhases:true → omits exactly mro/communities/processes', () => {
     expect(buildPhaseList({ skipGraphPhases: true }).map((p) => p.name)).toEqual(
       WITHOUT_GRAPH_PHASES,
+    );
+  });
+
+  it('skipResolutionPhases:true → omits scope resolution and dependent graph phases', () => {
+    expect(buildPhaseList({ skipResolutionPhases: true }).map((p) => p.name)).toEqual(
+      WITHOUT_RESOLUTION_PHASES,
     );
   });
 });
@@ -131,6 +145,13 @@ describe('buildPhaseList — taintSummaries opt-in (#2084)', () => {
     const names = buildPhaseList({ pdg: true, skipGraphPhases: true }).map((p) => p.name);
     expect(names).toContain('taintSummaries');
     expect(names).not.toContain('mro');
+  });
+
+  it('pdg:true is disabled when scope resolution is skipped', () => {
+    const names = buildPhaseList({ pdg: true, skipResolutionPhases: true }).map((p) => p.name);
+    expect(names).not.toContain('scopeResolution');
+    expect(names).not.toContain('taintSummaries');
+    expect(names).not.toContain('callSummaries');
   });
 
   it('no always-on phase depends on the pdg-gated taintSummaries/callSummaries phases', () => {

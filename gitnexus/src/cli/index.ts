@@ -86,8 +86,8 @@ program
   )
   .option(
     '--fast',
-    'Faster rebuild: skip MRO, community detection, and process extraction. ' +
-      'Keeps symbol/call/import indexing but omits clusters and flows.',
+    'Lean structural rebuild: keep files/symbols/routes where available but skip ' +
+      'scope resolution, precise calls/imports, MRO, clusters, flows, source snippets, and FTS.',
   )
   .option(
     '--default-branch <branch>',

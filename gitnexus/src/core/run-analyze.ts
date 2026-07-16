@@ -290,12 +290,12 @@ export interface AnalyzeResult {
   /** True when analyze only repaired FTS indexes and skipped pipeline re-analysis. */
   ftsRepairedOnly?: boolean;
   /**
-   * True when the FTS extension was unavailable so search-index creation was
-   * skipped (offline-first degradation). The graph is fully queryable; only
-   * full-text/BM25 search is disabled. Lets callers (CLI summary, server) and
-   * the persisted meta surface the degraded state instead of reporting healthy.
+   * True when search-index creation was skipped. The graph is still queryable;
+   * only full-text/BM25 search is disabled.
    */
   ftsSkipped?: boolean;
+  /** Why FTS was skipped, when `ftsSkipped` is true. */
+  ftsSkippedReason?: 'fast' | 'unavailable';
   /**
    * True when the index this run produced/validated is the primary/flat slot
    * (#2106 R2). `false` for a non-primary branch index. Lets the CLI skip
@@ -979,8 +979,9 @@ export async function runFullAnalysis(
   // ── Phase 1: Full Pipeline (0–60%) ────────────────────────────────
   if (options.fast === true) {
     log(
-      'Fast analyze: skipping MRO, community detection, and process extraction ' +
-        '(clusters/flows will be 0).',
+      'Fast analyze: building a lean structural index; skipping scope resolution, ' +
+        'MRO, community detection, process extraction, source-content persistence, and FTS ' +
+        '(precise CALLS/IMPORTS, clusters, and flows will be omitted).',
     );
   }
   const pipelineResult = await runPipelineFromRepo(
@@ -1014,6 +1015,7 @@ export async function runFullAnalysis(
       streamPdgEmit: resolveStreamPdgEmit(options),
       pdgEmitChunkSize: resolvePdgEmitChunkSize(options),
       skipGraphPhases: options.fast === true,
+      skipResolutionPhases: options.fast === true,
       parseChunkConcurrency: options.parseChunkConcurrency,
       chunkByteBudget: options.chunkByteBudget,
       fetchWrappers: options.fetchWrappers,
@@ -1256,11 +1258,20 @@ export async function runFullAnalysis(
       //    the SAME effectiveWriteSet so the subgraph and the deletes
       //    cover identical files (asymmetry would silently corrupt).
       const subgraph = extractChangedSubgraph(pipelineResult.graph, effectiveWriteSet);
-      await loadGraphToLbug(subgraph, pipelineResult.repoPath, storagePath, (msg) => {
-        lbugMsgCount++;
-        const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
-        progress('lbug', pct, msg);
-      });
+      await loadGraphToLbug(
+        subgraph,
+        pipelineResult.repoPath,
+        storagePath,
+        (msg) => {
+          lbugMsgCount++;
+          const pct = Math.min(84, 65 + Math.round((lbugMsgCount / (lbugMsgCount + 10)) * 19));
+          progress('lbug', pct, msg);
+        },
+        undefined,
+        {
+          includeContent: options.fast !== true,
+        },
+      );
     } else {
       // ── Full rebuild ───────────────────────────────────────────────
       // Pass the streamed PDG-emit manifest (#2202) so the BasicBlock layer that
@@ -1277,6 +1288,9 @@ export async function runFullAnalysis(
           progress('lbug', pct, msg);
         },
         pipelineResult.pdgEmitManifest,
+        {
+          includeContent: options.fast !== true,
+        },
       );
     }
 
@@ -1291,30 +1305,38 @@ export async function runFullAnalysis(
     // analyze still produces a fully queryable graph; only full-text/BM25
     // search falls back. `--repair-fts` (whose sole job is FTS) still fails
     // loudly on its own path above.
-    progress('fts', 85, 'Creating search indexes...');
-    const ftsAvailable = await loadFTSExtension(undefined, {
-      policy: resolveAnalyzeInstallPolicy(),
-    });
-    if (ftsAvailable) {
-      await createSearchFTSIndexes({
-        onIndexStart: options.verbose
-          ? (table, indexName) => log(`FTS: creating ${table}.${indexName}`)
-          : undefined,
-        onIndexReady: options.verbose
-          ? (table, indexName) => log(`FTS: ready ${table}.${indexName}`)
-          : undefined,
-      });
-      const missingIndexNames = await verifySearchFTSIndexes(executeQuery);
-      if (missingIndexNames.length > 0) {
-        throw new Error(
-          `FTS verification failed - missing indexes after analyze: ${missingIndexNames.join(', ')}. ` +
-            'Check FTS extension availability, then retry `gitnexus analyze --force` for a full rebuild.',
-        );
-      }
-      progress('fts', 90, 'Search indexes ready');
+    let ftsAvailable = false;
+    let ftsSkippedReason: 'fast' | 'unavailable' | undefined;
+    if (options.fast === true) {
+      ftsSkippedReason = 'fast';
+      progress('fts', 90, 'Search indexes skipped (fast mode)');
     } else {
-      log(FTS_UNAVAILABLE_MESSAGE);
-      progress('fts', 90, 'Search indexes skipped (FTS unavailable)');
+      progress('fts', 85, 'Creating search indexes...');
+      ftsAvailable = await loadFTSExtension(undefined, {
+        policy: resolveAnalyzeInstallPolicy(),
+      });
+      if (ftsAvailable) {
+        await createSearchFTSIndexes({
+          onIndexStart: options.verbose
+            ? (table, indexName) => log(`FTS: creating ${table}.${indexName}`)
+            : undefined,
+          onIndexReady: options.verbose
+            ? (table, indexName) => log(`FTS: ready ${table}.${indexName}`)
+            : undefined,
+        });
+        const missingIndexNames = await verifySearchFTSIndexes(executeQuery);
+        if (missingIndexNames.length > 0) {
+          throw new Error(
+            `FTS verification failed - missing indexes after analyze: ${missingIndexNames.join(', ')}. ` +
+              'Check FTS extension availability, then retry `gitnexus analyze --force` for a full rebuild.',
+          );
+        }
+        progress('fts', 90, 'Search indexes ready');
+      } else {
+        ftsSkippedReason = 'unavailable';
+        log(FTS_UNAVAILABLE_MESSAGE);
+        progress('fts', 90, 'Search indexes skipped (FTS unavailable)');
+      }
     }
 
     // ── Phase 3.5: Re-insert cached embeddings ────────────────────────
@@ -1681,6 +1703,7 @@ export async function runFullAnalysis(
       stats: meta.stats,
       pipelineResult,
       ftsSkipped: !ftsAvailable,
+      ftsSkippedReason,
       isPrimaryBranch: !placement.branch,
     };
   } catch (err) {
