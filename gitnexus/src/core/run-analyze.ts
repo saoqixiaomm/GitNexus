@@ -240,6 +240,16 @@ export interface AnalyzeOptions {
    */
   workerPoolSize?: number;
   /**
+   * Parse chunk read-ahead concurrency. Overlaps disk I/O with worker compute.
+   * Undefined keeps the parse phase default/env behavior.
+   */
+  parseChunkConcurrency?: number;
+  /**
+   * Source bytes per parse chunk. Larger chunks can better saturate worker
+   * pools; smaller chunks improve cache invalidation granularity.
+   */
+  chunkByteBudget?: number;
+  /**
    * Extra fetch-wrapper function names to treat as HTTP consumers, forwarded to
    * `PipelineOptions.fetchWrappers` (#1589/#1852 residual). Sourced from the CLI
    * `.gitnexusrc` `fetchWrappers` list. `undefined`/empty leaves the route
@@ -1004,6 +1014,8 @@ export async function runFullAnalysis(
       streamPdgEmit: resolveStreamPdgEmit(options),
       pdgEmitChunkSize: resolvePdgEmitChunkSize(options),
       skipGraphPhases: options.fast === true,
+      parseChunkConcurrency: options.parseChunkConcurrency,
+      chunkByteBudget: options.chunkByteBudget,
       fetchWrappers: options.fetchWrappers,
     },
   );

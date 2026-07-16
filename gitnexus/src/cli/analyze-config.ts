@@ -102,6 +102,8 @@ const KEY_SPECS: Record<string, KeySpec> = {
   workerTimeout: { target: 'workerTimeout', kind: 'numeric-string' },
   walCheckpointThreshold: { target: 'walCheckpointThreshold', kind: 'numeric-string' },
   workers: { target: 'workers', kind: 'numeric-string' },
+  parseChunkConcurrency: { target: 'parseChunkConcurrency', kind: 'numeric-string' },
+  chunkByteBudget: { target: 'chunkByteBudget', kind: 'numeric-string' },
   embeddingThreads: { target: 'embeddingThreads', kind: 'numeric-string' },
   embeddingBatchSize: { target: 'embeddingBatchSize', kind: 'numeric-string' },
   embeddingSubBatchSize: { target: 'embeddingSubBatchSize', kind: 'numeric-string' },

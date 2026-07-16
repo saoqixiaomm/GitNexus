@@ -46,6 +46,8 @@ describe('--skip-git CLI flag', () => {
     expect(helpOutput).toContain('--skip-skills');
     expect(helpOutput).toContain('--index-only');
     expect(helpOutput).toContain('--fast');
+    expect(helpOutput).toContain('--parse-chunk-concurrency');
+    expect(helpOutput).toContain('--chunk-byte-budget');
     expect(helpOutput).not.toContain('--no-git');
   });
 

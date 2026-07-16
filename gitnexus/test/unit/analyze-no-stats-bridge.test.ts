@@ -137,6 +137,33 @@ describe('analyzeCommand commander → runFullAnalysis noStats bridge (#1477)', 
     expect(opts.fast).toBe(true);
   });
 
+  it('passes parse throughput options through to runFullAnalysis as numbers', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, {
+      workers: '8',
+      parseChunkConcurrency: '4',
+      chunkByteBudget: '33554432',
+    });
+
+    const opts = runFullAnalysisMock.mock.calls[0][1];
+    expect(opts.workerPoolSize).toBe(8);
+    expect(opts.parseChunkConcurrency).toBe(4);
+    expect(opts.chunkByteBudget).toBe(33554432);
+  });
+
+  it('rejects invalid parse throughput options before running analysis', async () => {
+    const { analyzeCommand } = await import('../../src/cli/analyze.js');
+
+    await analyzeCommand(undefined, { parseChunkConcurrency: '0' });
+
+    expect(process.exitCode).toBe(1);
+    expect(cliErrorMock).toHaveBeenCalledWith(
+      expect.stringContaining('--parse-chunk-concurrency must be a positive integer'),
+    );
+    expect(runFullAnalysisMock).not.toHaveBeenCalled();
+  });
+
   it('rejects combining --repair-fts with --force', async () => {
     const { analyzeCommand } = await import('../../src/cli/analyze.js');
 

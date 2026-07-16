@@ -200,6 +200,10 @@ export const en = {
     'LadybugDB WAL auto-checkpoint threshold in bytes during analyze (integer >= -1; default: 67108864 = 64 MiB; -1 keeps Ladybug stock ~16 MiB).',
   'help.option.analyze.workers':
     'Parse worker pool size (>=1). Default: cores-1 capped at 16, auto-sized to the repo.',
+  'help.option.analyze.parseChunkConcurrency':
+    'Parse chunk read-ahead concurrency (>=1). Overlaps disk I/O with worker compute. Default: 2.',
+  'help.option.analyze.chunkByteBudget':
+    'Source bytes per parse chunk. Larger chunks can better saturate worker pools; smaller chunks improve cache granularity.',
   'help.option.analyze.embeddingThreads': 'Limit local ONNX embedding CPU threads',
   'help.option.analyze.embeddingBatchSize': 'Number of nodes per embedding batch',
   'help.option.analyze.embeddingSubBatchSize': 'Number of chunks per embedding model call',

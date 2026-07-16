@@ -67,6 +67,8 @@ const OPTION_DESCRIPTION_KEYS = {
   'analyze|--worker-timeout <seconds>': 'help.option.analyze.workerTimeout',
   'analyze|--wal-checkpoint-threshold <bytes>': 'help.option.analyze.walCheckpointThreshold',
   'analyze|--workers <n>': 'help.option.analyze.workers',
+  'analyze|--parse-chunk-concurrency <n>': 'help.option.analyze.parseChunkConcurrency',
+  'analyze|--chunk-byte-budget <bytes>': 'help.option.analyze.chunkByteBudget',
   'analyze|--embedding-threads <n>': 'help.option.analyze.embeddingThreads',
   'analyze|--embedding-batch-size <n>': 'help.option.analyze.embeddingBatchSize',
   'analyze|--embedding-sub-batch-size <n>': 'help.option.analyze.embeddingSubBatchSize',

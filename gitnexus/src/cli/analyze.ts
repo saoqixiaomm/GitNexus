@@ -683,6 +683,10 @@ export interface AnalyzeOptions {
   walCheckpointThreshold?: string;
   /** Parse worker pool size (>=1); 0 is rejected (no sequential mode). */
   workers?: string;
+  /** Concurrent parse chunk read-ahead. Overlaps disk I/O with worker compute. */
+  parseChunkConcurrency?: string;
+  /** Source bytes per parse chunk. Larger chunks can better saturate worker pools. */
+  chunkByteBudget?: string;
   embeddingThreads?: string;
   embeddingBatchSize?: string;
   embeddingSubBatchSize?: string;
@@ -939,6 +943,28 @@ const analyzeCommandImpl = async (
       return;
     }
     workerPoolSize = parsedWorkers;
+  }
+
+  let parseChunkConcurrency: number | undefined;
+  if (options.parseChunkConcurrency !== undefined) {
+    const parsed = Number(options.parseChunkConcurrency);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      cliError('  --parse-chunk-concurrency must be a positive integer (>= 1).\n');
+      process.exitCode = 1;
+      return;
+    }
+    parseChunkConcurrency = parsed;
+  }
+
+  let chunkByteBudget: number | undefined;
+  if (options.chunkByteBudget !== undefined) {
+    const parsed = Number(options.chunkByteBudget);
+    if (!Number.isInteger(parsed) || parsed < 1) {
+      cliError('  --chunk-byte-budget must be a positive integer byte count (>= 1).\n');
+      process.exitCode = 1;
+      return;
+    }
+    chunkByteBudget = parsed;
   }
 
   // Parse `--embeddings [limit]`: `true` → default cap, string → numeric cap
@@ -1309,6 +1335,8 @@ const analyzeCommandImpl = async (
         // GITNEXUS_WORKER_POOL_SIZE env mutation. `undefined` defers to the
         // env / auto-formula fallback inside the pipeline.
         workerPoolSize,
+        parseChunkConcurrency,
+        chunkByteBudget,
         // Extra fetch-wrapper names from `.gitnexusrc` (#1589/#1852 residual);
         // forwarded to the routes phase consumer scan.
         fetchWrappers: options.fetchWrappers,

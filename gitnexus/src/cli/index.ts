@@ -142,6 +142,14 @@ program
     '--workers <n>',
     'Parse worker pool size (>=1). Default: cores-1 capped at 16, auto-sized to the repo.',
   )
+  .option(
+    '--parse-chunk-concurrency <n>',
+    'Parse chunk read-ahead concurrency (>=1). Overlaps disk I/O with worker compute. Default: 2.',
+  )
+  .option(
+    '--chunk-byte-budget <bytes>',
+    'Source bytes per parse chunk. Larger chunks can better saturate worker pools; smaller chunks improve cache granularity.',
+  )
   .option('--embedding-threads <n>', 'Limit local ONNX embedding CPU threads')
   .option('--embedding-batch-size <n>', 'Number of nodes per embedding batch')
   .option('--embedding-sub-batch-size <n>', 'Number of chunks per embedding model call')

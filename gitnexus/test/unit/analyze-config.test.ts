@@ -113,6 +113,14 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
     expect(() => loadAnalyzeConfig(dir)).toThrow(/must be a boolean/);
   });
 
+  it('normalizes parse throughput tuning options', async () => {
+    await writeRc(JSON.stringify({ parseChunkConcurrency: 4, chunkByteBudget: 33554432 }));
+    expect(loadAnalyzeConfig(dir)).toEqual({
+      parseChunkConcurrency: '4',
+      chunkByteBudget: '33554432',
+    });
+  });
+
   it('parses the nested analyze form', async () => {
     await writeRc(JSON.stringify({ analyze: { defaultBranch: 'master', skipSkills: true } }));
     expect(loadAnalyzeConfig(dir)).toEqual({ defaultBranch: 'master', skipSkills: true });
@@ -280,6 +288,15 @@ describe('analyze-config (.gitnexusrc support, #243)', () => {
   it('mergeAnalyzeOptions: CLI fast value wins over config', () => {
     expect(mergeAnalyzeOptions({ fast: true }, { fast: false }).fast).toBe(true);
     expect(mergeAnalyzeOptions({ fast: false }, { fast: true }).fast).toBe(false);
+  });
+
+  it('mergeAnalyzeOptions: CLI parse throughput values win over config', () => {
+    const merged = mergeAnalyzeOptions(
+      { parseChunkConcurrency: '2', chunkByteBudget: '4194304' },
+      { parseChunkConcurrency: '4', chunkByteBudget: '33554432' },
+    );
+    expect(merged.parseChunkConcurrency).toBe('2');
+    expect(merged.chunkByteBudget).toBe('4194304');
   });
 
   it('mergeAnalyzeOptions: an explicit CLI false overrides a config true', () => {
